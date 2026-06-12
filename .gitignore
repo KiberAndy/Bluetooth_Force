@@ -1,0 +1,8 @@
+zig-out/
+.zig-cache/
+ToothTray.exe
+*.pdb
+*.obj
+*.iobj
+*.ipdb
+*.ilk
