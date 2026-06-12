@@ -451,8 +451,10 @@ const SilentKeepalive = struct {
     fn start(self: *SilentKeepalive) void {
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+            debug("btf: keepalive thread spawn failed: {s}", .{@errorName(err)});
             self.running.store(false, .release);
+            return;
         };
     }
 
@@ -484,7 +486,7 @@ const SilentKeepalive = struct {
         self.hwo = hwo;
 
         var hdr = WAVEHDR{
-            .lpData = &self.silence_buf,
+            .lpData = @ptrCast(&self.silence_buf),
             .dwBufferLength = KEEPALIVE_BUF_SIZE,
             .dwBytesRecorded = 0,
             .dwUser = 0,
