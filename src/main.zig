@@ -102,6 +102,65 @@ const INVALID_HANDLE_VALUE: ?*anyopaque = @ptrFromInt(~@as(usize, 0));
 const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4;
 
 // ---------------------------------------------------------------------------
+// WinMM externs (silent audio keepalive)
+// ---------------------------------------------------------------------------
+const WAVE_MAPPER: u32 = 0xFFFFFFFF;
+const CALLBACK_NULL: u32 = 0;
+const WAVE_FORMAT_PCM: u16 = 1;
+const WHDR_DONE: u32 = 0x00000001;
+const WAVERR_STILLPLAYING: u32 = 33;
+
+const WAVEFORMATEX = extern struct {
+    wFormatTag: u16,
+    nChannels: u16,
+    nSamplesPerSec: u32,
+    nAvgBytesPerSec: u32,
+    nBlockAlign: u16,
+    wBitsPerSample: u16,
+    cbSize: u16,
+};
+
+const WAVEHDR = extern struct {
+    lpData: ?*u8,
+    dwBufferLength: u32,
+    dwBytesRecorded: u32,
+    dwUser: usize,
+    dwFlags: u32,
+    dwLoops: u32,
+    lpNext: ?*WAVEHDR,
+    reserved: usize,
+};
+
+extern "winmm" fn waveOutOpen(
+    phwo: *?*anyopaque,
+    uDeviceID: u32,
+    pwfx: *const WAVEFORMATEX,
+    dwCallback: usize,
+    dwInstance: usize,
+    fdwOpen: u32,
+) callconv(WINAPI) u32;
+
+extern "winmm" fn waveOutPrepareHeader(
+    hwo: ?*anyopaque,
+    pwh: *WAVEHDR,
+    cbwh: u32,
+) callconv(WINAPI) u32;
+
+extern "winmm" fn waveOutWrite(
+    hwo: ?*anyopaque,
+    pwh: *WAVEHDR,
+    cbwh: u32,
+) callconv(WINAPI) u32;
+
+extern "winmm" fn waveOutUnprepareHeader(
+    hwo: ?*anyopaque,
+    pwh: *WAVEHDR,
+    cbwh: u32,
+) callconv(WINAPI) u32;
+
+extern "winmm" fn waveOutClose(hwo: ?*anyopaque) callconv(WINAPI) u32;
+
+// ---------------------------------------------------------------------------
 // User32 externs
 // ---------------------------------------------------------------------------
 extern "user32" fn DefWindowProcW(
@@ -370,6 +429,102 @@ const WINDOW_CLASS_NAME: [*:0]const u16 = &[_:0]u16{ 'B', 't', 'F', 'o', 'r', 'c
 const WINDOW_TITLE: [*:0]const u16 = &[_:0]u16{ 'B', 't', 'F', 'o', 'r', 'c', 'e' };
 
 // ---------------------------------------------------------------------------
+// Silent audio keepalive — prevents BT earbuds idle-disconnect
+// ---------------------------------------------------------------------------
+const KEEPALIVE_BUF_SIZE: u16 = 8192;
+
+const SilentKeepalive = struct {
+    hwo: ?*anyopaque,
+    thread: ?std.Thread,
+    running: std.atomic.Value(bool),
+    silence_buf: [KEEPALIVE_BUF_SIZE]u8,
+
+    fn init() SilentKeepalive {
+        return SilentKeepalive{
+            .hwo = null,
+            .thread = null,
+            .running = std.atomic.Value(bool).init(false),
+            .silence_buf = [_]u8{0} ** KEEPALIVE_BUF_SIZE,
+        };
+    }
+
+    fn start(self: *SilentKeepalive) void {
+        if (self.running.load(.acquire)) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+            self.running.store(false, .release);
+        };
+    }
+
+    fn stop(self: *SilentKeepalive) void {
+        if (!self.running.load(.acquire)) return;
+        self.running.store(false, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn run(self: *SilentKeepalive) void {
+        const fmt = WAVEFORMATEX{
+            .wFormatTag = WAVE_FORMAT_PCM,
+            .nChannels = 2,
+            .nSamplesPerSec = 44100,
+            .nAvgBytesPerSec = 176400,
+            .nBlockAlign = 4,
+            .wBitsPerSample = 16,
+            .cbSize = 0,
+        };
+
+        var hwo: ?*anyopaque = null;
+        if (waveOutOpen(&hwo, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) != 0) {
+            self.running.store(false, .release);
+            return;
+        }
+        self.hwo = hwo;
+
+        var hdr = WAVEHDR{
+            .lpData = &self.silence_buf,
+            .dwBufferLength = KEEPALIVE_BUF_SIZE,
+            .dwBytesRecorded = 0,
+            .dwUser = 0,
+            .dwFlags = 0,
+            .dwLoops = 0,
+            .lpNext = null,
+            .reserved = 0,
+        };
+
+        if (waveOutPrepareHeader(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) {
+            _ = waveOutClose(hwo);
+            self.running.store(false, .release);
+            return;
+        }
+
+        _ = waveOutWrite(hwo, &hdr, @sizeOf(WAVEHDR));
+
+        while (self.running.load(.acquire)) {
+            Sleep(60);
+            if (hdr.dwFlags & WHDR_DONE != 0) {
+                _ = waveOutUnprepareHeader(hwo, &hdr, @sizeOf(WAVEHDR));
+                hdr.dwFlags = 0;
+                if (waveOutPrepareHeader(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) break;
+                const rc2 = waveOutWrite(hwo, &hdr, @sizeOf(WAVEHDR));
+                if (rc2 != 0) {
+                    _ = waveOutUnprepareHeader(hwo, &hdr, @sizeOf(WAVEHDR));
+                    break;
+                }
+            }
+        }
+
+        while (hdr.dwFlags & WHDR_DONE == 0) Sleep(10);
+        _ = waveOutUnprepareHeader(hwo, &hdr, @sizeOf(WAVEHDR));
+        _ = waveOutClose(hwo);
+        self.hwo = null;
+        self.running.store(false, .release);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Shared state between threads
 // ---------------------------------------------------------------------------
 const SharedState = struct {
@@ -377,6 +532,7 @@ const SharedState = struct {
     target_mac: u64,
     resume_event: ?*anyopaque,
     bth: BthApi,
+    silent: SilentKeepalive,
 };
 
 // ---------------------------------------------------------------------------
@@ -594,9 +750,11 @@ fn performPoll(state: *SharedState, poll_count: u32) !void {
 
             if (device_info.fConnected != 0) {
                 debug("btf: [#{}] already connected — nothing to do", .{poll_count});
+                state.silent.start();
                 return;
             }
 
+            state.silent.stop();
             debug("btf: [#{}] not connected → launching ToothTrayCli connect", .{poll_count});
             triggerConnectionViaToothTray(name_buf[0..name_len]) catch |e| {
                 debug("btf: [#{}] ToothTrayCli error: {s}", .{ poll_count, @errorName(e) });
@@ -666,10 +824,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .target_mac = target_mac,
         .resume_event = resume_event,
         .bth = bth_api,
+        .silent = SilentKeepalive.init(),
     };
 
     const thread = try std.Thread.spawn(.{}, workerThread, .{&shared});
     defer {
+        shared.silent.stop();
         shared.running.store(false, .release);
         _ = SetEvent(resume_event);
         thread.join();
@@ -790,6 +950,7 @@ test "SharedState alignment" {
         .target_mac = 0xAABBCCDDEEFF,
         .resume_event = null,
         .bth = undefined,
+        .silent = undefined,
     };
     try expectEqual(@as(u64, 0xAABBCCDDEEFF), ss.target_mac);
     try expectEqual(true, ss.running.load(.acquire));

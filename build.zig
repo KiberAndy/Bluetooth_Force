@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
 
-    const libs = [_][]const u8{"user32"};
+    const libs = [_][]const u8{ "user32", "winmm" };
 
     const exe = b.addExecutable(.{
         .name = "bluetooth_force",
