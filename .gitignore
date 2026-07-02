@@ -1,6 +1,5 @@
 zig-out/
 .zig-cache/
-ToothTray.exe
 *.pdb
 *.obj
 *.iobj
@@ -8,3 +7,4 @@ ToothTray.exe
 *.ilk
 *.zip
 *.exe
+!ToothTray.exe
