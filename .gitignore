@@ -6,3 +6,5 @@ ToothTray.exe
 *.iobj
 *.ipdb
 *.ilk
+*.zip
+*.exe
