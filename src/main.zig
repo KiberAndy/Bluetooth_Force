@@ -167,6 +167,72 @@ extern "winmm" fn waveOutClose(hwo: ?*anyopaque) callconv(WINAPI) u32;
 
 extern "winmm" fn waveOutReset(hwo: ?*anyopaque) callconv(WINAPI) u32;
 
+extern "winmm" fn waveOutGetNumDevs() callconv(WINAPI) u32;
+
+extern "winmm" fn waveOutGetDevCapsW(
+    uDeviceID: usize,
+    pwoc: *WAVEOUTCAPSW,
+    cbwoc: u32,
+) callconv(WINAPI) u32;
+
+// WHDR loop flags — play the keepalive as a single looping buffer instead of a
+// high-frequency requeue loop (near-zero driver churn -> stops amplifying the
+// driver's ETW-registration leak).
+const WHDR_BEGINLOOP: u32 = 0x00000004;
+const WHDR_ENDLOOP: u32 = 0x00000008;
+
+const WAVEOUTCAPSW = extern struct {
+    wMid: u16,
+    wPid: u16,
+    vDriverVersion: u32,
+    szPname: [32]u16,
+    dwFormats: u32,
+    wChannels: u16,
+    wReserved1: u16,
+    dwSupport: u32,
+};
+
+// Monotonic millisecond clock for backoff / circuit-breaker timing. Zig 0.16's
+// std.time exposes no clock fn, so read it straight from the OS (Windows-only,
+// like every caller here).
+extern "kernel32" fn GetTickCount64() callconv(WINAPI) u64;
+
+fn nowMs() i64 {
+    return @intCast(GetTickCount64());
+}
+
+// Performance info (paged-pool self-watchdog). K32GetPerformanceInfo is exported
+// by kernel32.dll on Windows 7+, so we avoid an extra psapi link dependency.
+const PERFORMANCE_INFORMATION = extern struct {
+    cb: u32,
+    CommitTotal: usize,
+    CommitLimit: usize,
+    CommitPeak: usize,
+    PhysicalTotal: usize,
+    PhysicalAvailable: usize,
+    SystemCache: usize,
+    KernelTotal: usize,
+    KernelPaged: usize,
+    KernelNonpaged: usize,
+    PageSize: usize,
+    HandleCount: u32,
+    ProcessCount: u32,
+    ThreadCount: u32,
+};
+
+extern "kernel32" fn K32GetPerformanceInfo(
+    pPerformanceInformation: *PERFORMANCE_INFORMATION,
+    cb: u32,
+) callconv(WINAPI) i32;
+
+// Returns current system paged-pool usage in bytes, or null on failure.
+fn queryPagedPoolBytes() ?u64 {
+    var info: PERFORMANCE_INFORMATION = std.mem.zeroes(PERFORMANCE_INFORMATION);
+    info.cb = @sizeOf(PERFORMANCE_INFORMATION);
+    if (K32GetPerformanceInfo(&info, info.cb) == 0) return null;
+    return @as(u64, info.KernelPaged) * @as(u64, info.PageSize);
+}
+
 // ---------------------------------------------------------------------------
 // User32 externs
 // ---------------------------------------------------------------------------
@@ -494,6 +560,31 @@ fn loadBthApi() !BthApi {
 const POLL_INTERVAL_MS: u32 = 2000;
 const RESUME_DELAY_MS: u32 = 3000;
 
+// L3 — connect (ToothTray) backoff while the earbuds are unreachable. Capped at
+// 4s so a case-open still reconnects within ~one poll, but we stop hammering BT
+// while the earbuds are away. Reset to 0 on a successful connect.
+const CONNECT_BACKOFF_BASE_MS: u32 = 500;
+const CONNECT_BACKOFF_CAP_MS: u32 = 4000;
+
+// L5 — circuit breaker for ToothTray spawns (worker thread only).
+const CONNECT_CB_WINDOW_MS: i64 = 10_000;
+const CONNECT_CB_MAX_SPAWNS: u32 = 20;
+const CONNECT_CB_COOLDOWN_MS: i64 = 30_000;
+
+// L6 — paged-pool watchdog. The diagnosed leak climbs by gigabytes; 800MB over
+// the lowest-seen baseline is far above normal fluctuation yet trips long before
+// the ~16GB BSOD point. While tripped we pause keepalive + connects and log
+// loudly; we auto-clear once usage falls back near baseline. Because this reads
+// the *global* system pool, a bloat caused by some *other* process would also
+// trip us; the force-clear timeout below re-baselines and resumes the keepalive
+// so our core function can never be paused forever by an external hog.
+const WATCHDOG_TRIP_BYTES: u64 = 800 * 1024 * 1024;
+const WATCHDOG_CLEAR_BYTES: u64 = 200 * 1024 * 1024;
+// Force-clear a stuck watchdog after this long, re-baselining to current usage.
+const WATCHDOG_FORCE_CLEAR_MS: i64 = 30 * 60 * 1000;
+// Heartbeat log cadence while the watchdog stays tripped (visibility).
+const WATCHDOG_LOG_INTERVAL_MS: i64 = 60 * 1000;
+
 const WINDOW_CLASS_NAME: [*:0]const u16 = &[_:0]u16{ 'B', 't', 'F', 'o', 'r', 'c', 'e', 'W', 'i', 'n', 'd', 'o', 'w' };
 const WINDOW_TITLE: [*:0]const u16 = &[_:0]u16{ 'B', 't', 'F', 'o', 'r', 'c', 'e' };
 
@@ -506,6 +597,22 @@ const KEEPALIVE_BUF_SIZE: u16 = 8192;
 // waiting for the driver to flag a buffer DONE. Bounds every wait so shutdown
 // and error paths can never hang the process.
 const KEEPALIVE_DRAIN_SPINS: u32 = 400; // 400 * 5ms = 2s hard cap
+
+// L3 backoff bounds for keepalive (re)open failures.
+const KEEPALIVE_BACKOFF_BASE_MS: u32 = 250;
+const KEEPALIVE_BACKOFF_CAP_MS: u32 = 5000;
+
+// L5 circuit-breaker tuning for keepalive opens. Normal operation opens the
+// device roughly once per connect session, so 30 opens / 10s is huge headroom
+// for legitimate device-switch churn yet trips long before any storm.
+const KEEPALIVE_CB_WINDOW_MS: i64 = 10_000;
+const KEEPALIVE_CB_MAX_OPENS: u32 = 30;
+const KEEPALIVE_CB_COOLDOWN_MS: i64 = 30_000;
+
+// A huge loop count makes the single keepalive buffer play effectively forever
+// (~46ms/buffer * 2^31 ≈ years), so the driver is touched once per session
+// instead of ~16x/second.
+const KEEPALIVE_LOOP_COUNT: u32 = 0x7FFF_FFFF;
 
 // Fill the keepalive buffer with an inaudible, *non-zero* dither (alternating
 // +/-1 LSB per 16-bit sample). A pure-silence (all-zero) stream can be treated
@@ -533,6 +640,15 @@ const SilentKeepalive = struct {
     // solely via `thread`, so a self-exited worker is always joined (no leak).
     want_run: std.atomic.Value(bool),
     silence_buf: [KEEPALIVE_BUF_SIZE]u8,
+    // L2 — resolved waveOut endpoint. Defaults to WAVE_MAPPER (system default)
+    // and is replaced with the earbuds' own endpoint once resolved, so the
+    // keepalive stops streaming through the FxSound default-device APO (the
+    // component that amplified the driver's ETW leak).
+    device_id: u32,
+    // Optional user override substring for the audio endpoint name (CLI arg 3).
+    override_name: ?[]const u8,
+    // L5 — circuit breaker scoped to this (single) keepalive thread.
+    breaker: CircuitBreaker,
 
     fn init() SilentKeepalive {
         var s = SilentKeepalive{
@@ -540,18 +656,65 @@ const SilentKeepalive = struct {
             .thread = null,
             .want_run = std.atomic.Value(bool).init(false),
             .silence_buf = [_]u8{0} ** KEEPALIVE_BUF_SIZE,
+            .device_id = WAVE_MAPPER,
+            .override_name = null,
+            .breaker = .{
+                .window_ms = KEEPALIVE_CB_WINDOW_MS,
+                .max_events = KEEPALIVE_CB_MAX_OPENS,
+                .cooldown_ms = KEEPALIVE_CB_COOLDOWN_MS,
+            },
         };
         fillKeepaliveBuffer(&s.silence_buf);
         return s;
     }
 
+    // L2 — Enumerate waveOut endpoints and pick the earbuds' own device so the
+    // keepalive bypasses FxSound. Called from the worker thread on (re)start
+    // while no playback thread exists. Best-effort: on any failure it leaves
+    // device_id = WAVE_MAPPER (still bounded by the circuit breaker).
+    fn resolveDevice(self: *SilentKeepalive, bt_name: []const u8) void {
+        const n = waveOutGetNumDevs();
+        if (n == 0) return;
+
+        // szPname is up to 31 UTF-16 chars; worst-case UTF-8 is 3 bytes/char
+        // (~93 bytes), so 128 leaves headroom and never truncates a non-ASCII
+        // (e.g. Cyrillic/CJK) endpoint name into an empty string that fails to
+        // match and silently falls back to WAVE_MAPPER (the FxSound APO).
+        var name_store: [16][128]u8 = undefined;
+        var name_slices: [16][]const u8 = undefined;
+        var count: usize = 0;
+        var dev: u32 = 0;
+        while (dev < n and count < name_store.len) : (dev += 1) {
+            var caps: WAVEOUTCAPSW = std.mem.zeroes(WAVEOUTCAPSW);
+            if (waveOutGetDevCapsW(dev, &caps, @sizeOf(WAVEOUTCAPSW)) != 0) continue;
+            var w_len: usize = 0;
+            while (w_len < caps.szPname.len and caps.szPname[w_len] != 0) : (w_len += 1) {}
+            const u8_len = std.unicode.utf16LeToUtf8(&name_store[count], caps.szPname[0..w_len]) catch 0;
+            name_slices[count] = name_store[count][0..u8_len];
+            debug("waveOut[{}] = {s}", .{ dev, name_slices[count] });
+            count += 1;
+        }
+
+        if (selectAudioDevice(name_slices[0..count], bt_name, self.override_name)) |idx| {
+            self.device_id = @intCast(idx);
+            debug("keepalive -> endpoint #{} ({s})", .{ idx, name_slices[idx] });
+        } else {
+            self.device_id = WAVE_MAPPER;
+            debug("keepalive -> WAVE_MAPPER (no earbud endpoint matched)", .{});
+        }
+    }
+
     // start()/stop() are only ever called from the single worker thread, never
     // concurrently with each other.
-    fn start(self: *SilentKeepalive) void {
+    fn start(self: *SilentKeepalive, bt_name: []const u8) void {
         // A live thread already owns the session. Guarding on the thread handle
         // (not on want_run) means a worker that self-exited on an open failure
         // is still tracked and will be joined by stop() -> no handle leak.
         if (self.thread != null) return;
+        // Resolve the earbud endpoint fresh on each start so a re-paired device
+        // (new endpoint id) is picked up, and so the keepalive targets the
+        // earbuds directly instead of the FxSound default-device APO.
+        self.resolveDevice(bt_name);
         self.want_run.store(true, .release);
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
             debug("keepalive thread spawn failed: {s}", .{@errorName(err)});
@@ -574,20 +737,49 @@ const SilentKeepalive = struct {
     fn run(self: *SilentKeepalive) void {
         // Resilient outer loop: if a render session dies (device switch, FxSound
         // re-initialising the audio engine, default-device change, transient
-        // MMSYSERR) we briefly back off and reopen instead of silently giving
-        // up. Previously a single failure killed the keepalive permanently and
-        // the earbuds would idle-disconnect again.
+        // MMSYSERR) we back off and reopen instead of silently giving up.
+        // L3 backoff + L5 circuit breaker bound how fast we can reopen, so a
+        // pathological open/fail cycle can never become a registration storm.
+        var fails: u32 = 0;
         while (self.want_run.load(.acquire)) {
-            runSession(self);
-            if (self.want_run.load(.acquire)) Sleep(500);
+            const now = nowMs();
+            if (!self.breaker.allow(now)) {
+                debug("keepalive circuit OPEN — cooling down", .{});
+                self.interruptibleSleep(1000);
+                continue;
+            }
+
+            const opened = self.runSession();
+            if (opened) {
+                fails = 0;
+            } else {
+                fails +|= 1;
+            }
+
+            if (self.want_run.load(.acquire)) {
+                const wait_ms = if (opened) 500 else backoffMs(fails, KEEPALIVE_BACKOFF_BASE_MS, KEEPALIVE_BACKOFF_CAP_MS);
+                self.interruptibleSleep(wait_ms);
+            }
         }
     }
 
-    // One waveOut open->play->close session. Returns when playback can no longer
-    // continue (stop requested or an unrecoverable device error). Every wait is
-    // bounded and the header is always reset+unprepared before close, so this
-    // can neither hang nor leave the driver referencing our stack buffer.
-    fn runSession(self: *SilentKeepalive) void {
+    // Sleep in small slices so stop() is honoured within ~50ms even during a
+    // long backoff wait.
+    fn interruptibleSleep(self: *SilentKeepalive, total_ms: u32) void {
+        var slept: u32 = 0;
+        while (slept < total_ms and self.want_run.load(.acquire)) : (slept += 50) {
+            Sleep(@min(@as(u32, 50), total_ms - slept));
+        }
+    }
+
+    // One waveOut open->play->close session. Opens the *resolved endpoint* and
+    // queues a single looping buffer, so the driver is touched once per session
+    // instead of ~16x/second — the key change that stops amplifying the driver's
+    // ETW-registration leak. Returns true if the device opened, false on open
+    // failure. Every wait is bounded and the header is always reset+unprepared
+    // before close, so this can neither hang nor leave the driver referencing
+    // our buffer.
+    fn runSession(self: *SilentKeepalive) bool {
         const fmt = WAVEFORMATEX{
             .wFormatTag = WAVE_FORMAT_PCM,
             .nChannels = 2,
@@ -599,7 +791,7 @@ const SilentKeepalive = struct {
         };
 
         var hwo: ?*anyopaque = null;
-        if (waveOutOpen(&hwo, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) != 0) return;
+        if (waveOutOpen(&hwo, self.device_id, &fmt, 0, 0, CALLBACK_NULL) != 0) return false;
         self.hwo = hwo;
         defer {
             self.hwo = null;
@@ -611,30 +803,29 @@ const SilentKeepalive = struct {
             .dwBufferLength = KEEPALIVE_BUF_SIZE,
             .dwBytesRecorded = 0,
             .dwUser = 0,
-            .dwFlags = 0,
-            .dwLoops = 0,
+            .dwFlags = WHDR_BEGINLOOP | WHDR_ENDLOOP,
+            .dwLoops = KEEPALIVE_LOOP_COUNT,
             .lpNext = null,
             .reserved = 0,
         };
 
-        if (waveOutPrepareHeader(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return;
-        // Tracks whether `hdr` is currently queued in the driver. Only a queued
-        // buffer can have WHDR_DONE raised asynchronously, so the drain spin
-        // below is meaningful only while `queued` is true.
+        if (waveOutPrepareHeader(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return false;
+        // Tracks whether `hdr` is currently sitting in the driver's queue. Only a
+        // queued buffer can ever have WHDR_DONE raised, so the drain spin below
+        // is meaningful *only* while queued. Skipping it on the not-queued error
+        // paths (write failed, or a failed re-arm) avoids burning the full ~2s
+        // cap waiting for a DONE flag that can never come.
         var queued = false;
         // Guarantee the driver stops referencing `hdr`/`silence_buf` before this
-        // stack frame unwinds. waveOutReset forces all queued buffers to DONE;
-        // the bounded spin then waits for that flag before unpreparing. Without
-        // the bound (the old code's unbounded `while (DONE == 0)`) a buffer that
-        // was never successfully queued -- e.g. when waveOutWrite failed --
-        // would hang shutdown forever. Skipping the spin when nothing was ever
-        // queued also avoids burning the full ~2s cap for nothing.
+        // stack frame unwinds. waveOutReset forces queued buffers to DONE; the
+        // bounded spin then waits for that flag (read atomically — the winmm
+        // driver thread writes it) before unpreparing. The bound turns the old
+        // unbounded `while (DONE == 0)` into a hard ~2s ceiling so shutdown can
+        // never hang.
         defer {
             _ = waveOutReset(hwo);
             if (queued) {
                 var spins: u32 = 0;
-                // WHDR_DONE is written by the winmm driver thread; read it
-                // atomically to avoid a data race with that thread.
                 while (@atomicLoad(u32, &hdr.dwFlags, .acquire) & WHDR_DONE == 0 and spins < KEEPALIVE_DRAIN_SPINS) : (spins += 1) {
                     Sleep(5);
                 }
@@ -642,21 +833,25 @@ const SilentKeepalive = struct {
             _ = waveOutUnprepareHeader(hwo, &hdr, @sizeOf(WAVEHDR));
         }
 
-        if (waveOutWrite(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return;
+        if (waveOutWrite(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return false;
         queued = true;
 
+        // The looping buffer plays for ~years; we idle here until stop is
+        // requested. If the loop ever does finish (DONE set), re-arm it once —
+        // still far below any churn that could matter.
         while (self.want_run.load(.acquire)) {
-            Sleep(60);
-            // Atomic read: the driver sets WHDR_DONE from its own thread.
+            Sleep(200);
             if (@atomicLoad(u32, &hdr.dwFlags, .acquire) & WHDR_DONE != 0) {
                 _ = waveOutUnprepareHeader(hwo, &hdr, @sizeOf(WAVEHDR));
                 queued = false;
-                @atomicStore(u32, &hdr.dwFlags, 0, .release);
-                if (waveOutPrepareHeader(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return;
-                if (waveOutWrite(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return;
+                @atomicStore(u32, &hdr.dwFlags, WHDR_BEGINLOOP | WHDR_ENDLOOP, .release);
+                hdr.dwLoops = KEEPALIVE_LOOP_COUNT;
+                if (waveOutPrepareHeader(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return false;
+                if (waveOutWrite(hwo, &hdr, @sizeOf(WAVEHDR)) != 0) return false;
                 queued = true;
             }
         }
+        return true;
     }
 };
 
@@ -670,6 +865,20 @@ const SharedState = struct {
     bth: BthApi,
     silent: SilentKeepalive,
     last_tooth_tray_handle: ?*anyopaque,
+    // L3 — ToothTray connect backoff.
+    connect_fails: u32 = 0,
+    next_connect_ms: i64 = 0,
+    // L5 — ToothTray spawn circuit breaker (worker thread only).
+    tt_breaker: CircuitBreaker = .{
+        .window_ms = CONNECT_CB_WINDOW_MS,
+        .max_events = CONNECT_CB_MAX_SPAWNS,
+        .cooldown_ms = CONNECT_CB_COOLDOWN_MS,
+    },
+    // L6 — paged-pool watchdog state.
+    pool_min_bytes: u64 = std.math.maxInt(u64),
+    watchdog_tripped: bool = false,
+    watchdog_tripped_ms: i64 = 0,
+    watchdog_last_log_ms: i64 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -750,6 +959,125 @@ fn quoteArgInto(buf: []u8, arg: []const u8) ![]u8 {
     }
     try emit(buf, &n, '"');
     return buf[0..n];
+}
+
+// ---------------------------------------------------------------------------
+// Multi-layer leak protection — pure, unit-testable logic
+// ---------------------------------------------------------------------------
+
+// L3 — Exponential backoff with a hard cap. failures==0 -> 0 (happy path, no
+// delay). Pure.
+fn backoffMs(consecutive_failures: u32, base_ms: u32, cap_ms: u32) u32 {
+    if (consecutive_failures == 0) return 0;
+    var v: u64 = base_ms;
+    var i: u32 = 1;
+    while (i < consecutive_failures) : (i += 1) {
+        v *%= 2;
+        if (v >= cap_ms) return cap_ms;
+    }
+    return @intCast(@min(v, @as(u64, cap_ms)));
+}
+
+// L5 — Circuit breaker. Counts expensive OS calls (waveOutOpen attempts,
+// ToothTray spawns) in a fixed (tumbling) window: the window resets in full
+// once window_ms elapses, rather than sliding continuously. If the count
+// exceeds max_events the circuit OPENS for cooldown_ms, during which allow()
+// returns false. Makes a runaway registration storm physically impossible.
+// Single-threaded per instance.
+const CircuitBreaker = struct {
+    window_ms: i64,
+    max_events: u32,
+    cooldown_ms: i64,
+    count: u32 = 0,
+    window_start_ms: i64 = 0,
+    tripped_until_ms: i64 = 0,
+    trip_count: u32 = 0,
+
+    fn allow(self: *CircuitBreaker, now_ms: i64) bool {
+        if (now_ms < self.tripped_until_ms) return false;
+        if (now_ms - self.window_start_ms >= self.window_ms) {
+            self.window_start_ms = now_ms;
+            self.count = 0;
+        }
+        self.count += 1;
+        if (self.count > self.max_events) {
+            self.tripped_until_ms = now_ms + self.cooldown_ms;
+            self.trip_count += 1;
+            self.count = 0;
+            self.window_start_ms = now_ms;
+            return false;
+        }
+        return true;
+    }
+
+    fn isTripped(self: *const CircuitBreaker, now_ms: i64) bool {
+        return now_ms < self.tripped_until_ms;
+    }
+};
+
+// L6 — Paged-pool watchdog decision. Trips when current usage exceeds the
+// lowest-seen baseline by more than threshold_bytes. Pure.
+fn watchdogTripped(min_baseline_bytes: u64, current_bytes: u64, threshold_bytes: u64) bool {
+    return current_bytes > min_baseline_bytes and (current_bytes - min_baseline_bytes) > threshold_bytes;
+}
+
+// Case-insensitive ASCII substring test (allocation-free). Non-ASCII bytes
+// compare verbatim.
+fn asciiLower(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return false;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (asciiLower(haystack[i + j]) != asciiLower(needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+fn isFxSoundName(name: []const u8) bool {
+    return containsIgnoreCase(name, "fxsound") or containsIgnoreCase(name, "fx sound");
+}
+
+// L2 — Pick the waveOut device that routes the keepalive directly to the
+// earbuds, bypassing the FxSound default-device APO (the storm amplifier).
+//   1. If `override` is set, return the first device whose name contains it.
+//   2. Otherwise match any >=4-char alphanumeric token of the Bluetooth device
+//      name against the endpoint names, skipping FxSound endpoints.
+// Returns the device index, or null to fall back to WAVE_MAPPER. Pure.
+fn selectAudioDevice(names: []const []const u8, bt_name: []const u8, override: ?[]const u8) ?usize {
+    if (override) |ov| {
+        if (ov.len > 0) {
+            for (names, 0..) |n, idx| {
+                if (containsIgnoreCase(n, ov)) return idx;
+            }
+            return null;
+        }
+    }
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= bt_name.len) : (i += 1) {
+        const at_end = i == bt_name.len;
+        const is_sep = at_end or !(std.ascii.isAlphanumeric(bt_name[i]));
+        if (is_sep) {
+            const token = bt_name[start..i];
+            if (token.len >= 4) {
+                for (names, 0..) |n, idx| {
+                    if (isFxSoundName(n)) continue;
+                    if (containsIgnoreCase(n, token)) return idx;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    return null;
 }
 
 fn getSelfDir(buf: []u8) ![]u8 {
@@ -874,6 +1202,10 @@ fn workerThread(state: *SharedState) void {
 
         if (!state.running.load(.acquire)) break;
 
+        // L6 — sample paged pool each cycle; pause keepalive/connects if the
+        // system pool is growing abnormally (the diagnosed driver leak).
+        sampleWatchdog(state);
+
         poll_count += 1;
         performPoll(state, poll_count) catch |e| {
             if (e != error.ToothTrayBusy) {
@@ -881,6 +1213,49 @@ fn workerThread(state: *SharedState) void {
             }
             continue;
         };
+    }
+}
+
+// L6 — Sample system paged-pool and pause/resume on abnormal growth. Tracks the
+// lowest-seen usage as baseline so a one-time post-boot ramp doesn't false-trip.
+fn sampleWatchdog(state: *SharedState) void {
+    const cur = queryPagedPoolBytes() orelse return;
+    if (cur < state.pool_min_bytes) state.pool_min_bytes = cur;
+    const now = nowMs();
+
+    if (!state.watchdog_tripped) {
+        if (watchdogTripped(state.pool_min_bytes, cur, WATCHDOG_TRIP_BYTES)) {
+            state.watchdog_tripped = true;
+            state.watchdog_tripped_ms = now;
+            state.watchdog_last_log_ms = now;
+            debug("WATCHDOG TRIPPED: paged pool +{} MB over baseline — pausing keepalive/connects", .{(cur - state.pool_min_bytes) / (1024 * 1024)});
+            state.silent.stop();
+        }
+        return;
+    }
+
+    // Tripped. Preferred exit: the pool falls back near baseline.
+    if (cur <= state.pool_min_bytes + WATCHDOG_CLEAR_BYTES) {
+        state.watchdog_tripped = false;
+        debug("watchdog cleared: paged pool back near baseline", .{});
+        return;
+    }
+
+    // Safety exit: the pool has stayed high for too long. Since we measure the
+    // *global* system pool, an external process could keep it elevated forever;
+    // force-clear and re-baseline to the current level so the keepalive resumes
+    // (a permanently paused keepalive would silently break our whole purpose).
+    if (now - state.watchdog_tripped_ms >= WATCHDOG_FORCE_CLEAR_MS) {
+        state.watchdog_tripped = false;
+        state.pool_min_bytes = cur;
+        debug("watchdog force-clear after timeout; re-baselining to {} MB and resuming", .{cur / (1024 * 1024)});
+        return;
+    }
+
+    // Still tripped: periodic heartbeat so the paused state is visible in logs.
+    if (now - state.watchdog_last_log_ms >= WATCHDOG_LOG_INTERVAL_MS) {
+        state.watchdog_last_log_ms = now;
+        debug("watchdog still tripped: paged pool {} MB (+{} MB over baseline)", .{ cur / (1024 * 1024), (cur - state.pool_min_bytes) / (1024 * 1024) });
     }
 }
 
@@ -973,36 +1348,70 @@ fn performPoll(state: *SharedState, _: u32) !void {
         }
 
         if (found) {
+            // Decode the device name once (best-effort). Unlike the old code, the
+            // name is now needed on BOTH branches: the keepalive uses it to pick
+            // the earbuds' own audio endpoint (L2). A name that fails UTF-16 ->
+            // UTF-8 conversion must still never prevent the keepalive from
+            // starting (that is the app's whole job), so on decode failure we
+            // fall back to an empty name -> resolveDevice() uses WAVE_MAPPER,
+            // still bounded by the circuit breaker.
+            var name_buf: [1024]u8 = undefined;
+            var name_u16_len: usize = 0;
+            while (name_u16_len < 248 and device_info.szName[name_u16_len] != 0) : (name_u16_len += 1) {}
+            // utf16LeToUtf8 returns the number of bytes written (usize), not a
+            // slice; capture the length and slice the buffer ourselves. On decode
+            // failure fall back to length 0 -> empty name -> WAVE_MAPPER.
+            const name_len = std.unicode.utf16LeToUtf8(name_buf[0..], device_info.szName[0..name_u16_len]) catch blk: {
+                debug("utf16 conversion error; using default audio endpoint", .{});
+                break :blk 0;
+            };
+            const name: []const u8 = name_buf[0..name_len];
+
             // Route through the pure decision function so the tested logic and
             // the production logic can never drift apart.
             switch (decidePollAction(found, device_info.fConnected)) {
                 .start_keepalive => {
-                    // Earbuds are connected: start the silent keepalive. This is
-                    // the *only* call site that starts sound playback. The device
-                    // name is deliberately NOT decoded on this path -- a name
-                    // that fails UTF-16 -> UTF-8 conversion must never prevent
-                    // the keepalive from starting (that is the app's whole job),
-                    // so name decoding lives only in the stop_and_connect branch
-                    // below, which is its only consumer.
-                    state.silent.start();
+                    // Earbuds are connected: reset connect backoff and start the
+                    // endpoint-targeted keepalive — unless the watchdog paused us.
+                    state.connect_fails = 0;
+                    state.next_connect_ms = 0;
+                    if (!state.watchdog_tripped) state.silent.start(name);
                     return;
                 },
                 .stop_and_connect => {
+                    // Not connected: stop any keepalive (no point streaming to an
+                    // absent device -> avoids FxSound/driver churn while away).
                     state.silent.stop();
-                    var name_buf: [1024]u8 = undefined;
-                    var name_u16_len: usize = 0;
-                    while (name_u16_len < 248 and device_info.szName[name_u16_len] != 0) : (name_u16_len += 1) {}
-                    const name_len = std.unicode.utf16LeToUtf8(name_buf[0..], device_info.szName[0..name_u16_len]) catch |err| {
-                        debug("utf16 conversion error: {s}", .{@errorName(err)});
+                    if (state.watchdog_tripped) return;
+
+                    const now = nowMs();
+                    if (now < state.next_connect_ms) return; // L3 backoff window
+                    if (!state.tt_breaker.allow(now)) { // L5 circuit breaker
+                        debug("connect circuit OPEN — cooling down", .{});
+                        return;
+                    }
+
+                    triggerConnectionViaToothTray(state, name) catch |e| {
+                        switch (e) {
+                            error.ToothTrayBusy => {}, // prior attempt still running; no penalty
+                            else => {
+                                debug("ToothTrayCli error: {s}", .{@errorName(e)});
+                                state.connect_fails +|= 1;
+                                state.next_connect_ms = now + backoffMs(
+                                    state.connect_fails,
+                                    CONNECT_BACKOFF_BASE_MS,
+                                    CONNECT_BACKOFF_CAP_MS,
+                                );
+                            },
+                        }
                         return;
                     };
-                    triggerConnectionViaToothTray(state, name_buf[0..name_len]) catch |e| {
-                        debug("ToothTrayCli error: {s}", .{@errorName(e)});
-                    };
+                    // Spawn succeeded and ToothTray reported success.
+                    state.connect_fails = 0;
+                    state.next_connect_ms = 0;
                     return;
                 },
-                // found == true rules out .none; fall through to next-radio
-                // scanning would be harmless but is unreachable here.
+                // found == true rules out .none.
                 .none => {},
             }
         }
@@ -1067,11 +1476,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var args_it = try init.args.iterateAllocator(std.heap.page_allocator);
     defer args_it.deinit();
 
-    _ = args_it.next() orelse exitWithError("Usage: bluetooth_force.exe AA:BB:CC:DD:EE:FF");
-    const mac_str = args_it.next() orelse exitWithError("Usage: bluetooth_force.exe AA:BB:CC:DD:EE:FF");
+    _ = args_it.next() orelse exitWithError("Usage: bluetooth_force.exe AA:BB:CC:DD:EE:FF [audio-name-substring]");
+    const mac_str = args_it.next() orelse exitWithError("Usage: bluetooth_force.exe AA:BB:CC:DD:EE:FF [audio-name-substring]");
     const target_mac = parseMacAddr(mac_str) catch |err| switch (err) {
         error.ZeroMacAddress => exitWithError("MAC must be non-zero (00:00:00:00:00:00 is not a valid device)"),
         else => exitWithError("Invalid MAC address format"),
+    };
+
+    // Optional 3rd arg: explicit audio endpoint name substring. By default the
+    // keepalive auto-discovers the earbuds' own endpoint (L2); this override is
+    // only needed if auto-detection picks the wrong device. Copied into a buffer
+    // that lives for the whole process (this frame runs the message loop).
+    var audio_override_buf: [128]u8 = undefined;
+    const audio_override: ?[]const u8 = blk: {
+        const a = args_it.next() orelse break :blk null;
+        if (a.len == 0) break :blk null;
+        const n = @min(a.len, audio_override_buf.len);
+        @memcpy(audio_override_buf[0..n], a[0..n]);
+        break :blk audio_override_buf[0..n];
     };
 
     const bth_api = loadBthApi() catch exitWithError("Failed to load bthprops.cpl Bluetooth API");
@@ -1088,6 +1510,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .silent = SilentKeepalive.init(),
         .last_tooth_tray_handle = null,
     };
+    // Apply the optional CLI audio-endpoint override before the worker starts
+    // (the worker's first start() reads it during device resolution).
+    shared.silent.override_name = audio_override;
 
     // Create the message-only window BEFORE spawning the worker. exitWithError
     // calls ExitProcess, which skips defers; by finishing all fallible window
@@ -2250,4 +2675,110 @@ test "quoteArgInto: hostile name with an embedded quote stays one argument" {
 test "quoteArgInto: returns error when the buffer is too small" {
     var buf: [4]u8 = undefined;
     try testing.expectError(error.NameTooLong, quoteArgInto(&buf, "toolong"));
+}
+
+//------------------------------------------------------------------------------
+// Leak-fix layers L2/L3/L5/L6 — pure logic unit tests
+//------------------------------------------------------------------------------
+
+test "backoffMs: zero failures means no delay (happy path)" {
+    try expectEqual(@as(u32, 0), backoffMs(0, 500, 4000));
+}
+
+test "backoffMs: grows exponentially and is capped" {
+    try expectEqual(@as(u32, 500), backoffMs(1, 500, 4000));
+    try expectEqual(@as(u32, 1000), backoffMs(2, 500, 4000));
+    try expectEqual(@as(u32, 2000), backoffMs(3, 500, 4000));
+    try expectEqual(@as(u32, 4000), backoffMs(4, 500, 4000));
+    // Beyond the cap it stays clamped, never overflowing.
+    try expectEqual(@as(u32, 4000), backoffMs(50, 500, 4000));
+}
+
+test "CircuitBreaker: trips after exceeding max_events in the window" {
+    var cb = CircuitBreaker{ .window_ms = 10_000, .max_events = 3, .cooldown_ms = 30_000 };
+    // First three attempts inside the window are allowed.
+    try expect(cb.allow(1000));
+    try expect(cb.allow(1100));
+    try expect(cb.allow(1200));
+    // The fourth exceeds max_events -> circuit OPENS.
+    try expect(!cb.allow(1300));
+    try expect(cb.isTripped(1300));
+    // Still open during cooldown.
+    try expect(!cb.allow(5000));
+    try expect(cb.trip_count == 1);
+}
+
+test "CircuitBreaker: recovers and allows again after cooldown elapses" {
+    var cb = CircuitBreaker{ .window_ms = 10_000, .max_events = 2, .cooldown_ms = 30_000 };
+    try expect(cb.allow(0));
+    try expect(cb.allow(100));
+    try expect(!cb.allow(200)); // trips at t=200, open until t=30_200
+    // Still open during the cooldown window (ends at 200 + 30_000 = 30_200).
+    try expect(cb.isTripped(30_000));
+    // Cooldown fully elapsed -> no longer tripped.
+    try expect(!cb.isTripped(30_201));
+    // After cooldown, allow() works again.
+    try expect(cb.allow(30_201));
+}
+
+test "watchdogTripped: only trips when growth over baseline exceeds threshold" {
+    const mb = 1024 * 1024;
+    // Below threshold -> no trip.
+    try expect(!watchdogTripped(100 * mb, 500 * mb, 800 * mb));
+    // Exactly at threshold -> not strictly greater -> no trip.
+    try expect(!watchdogTripped(100 * mb, 900 * mb, 800 * mb));
+    // Over threshold -> trips.
+    try expect(watchdogTripped(100 * mb, 901 * mb, 800 * mb));
+    // current below baseline can never trip (no underflow).
+    try expect(!watchdogTripped(500 * mb, 100 * mb, 800 * mb));
+}
+
+test "containsIgnoreCase / isFxSoundName: case-insensitive matching" {
+    try expect(containsIgnoreCase("Speakers (FxSound Audio)", "fxsound"));
+    try expect(containsIgnoreCase("WF-1000XM5 Stereo", "xm5"));
+    try expect(!containsIgnoreCase("Realtek", "fxsound"));
+    try expect(!containsIgnoreCase("abc", "abcd")); // needle longer than haystack
+    try expect(!containsIgnoreCase("abc", "")); // empty needle never matches
+    try expect(isFxSoundName("FxSound Speakers"));
+    try expect(isFxSoundName("Fx Sound Device"));
+    try expect(!isFxSoundName("Headphones (WF-1000XM5)"));
+}
+
+test "selectAudioDevice: picks the earbud endpoint and skips FxSound" {
+    const names = [_][]const u8{
+        "Speakers (FxSound Audio Enhancer)",
+        "Headphones (WF-1000XM5 Stereo)",
+        "Realtek HD Audio",
+    };
+    // Bluetooth name shares the 'WF-1000XM5' token with endpoint #1.
+    const idx = selectAudioDevice(&names, "WF-1000XM5", null);
+    try expect(idx != null);
+    try expectEqual(@as(usize, 1), idx.?);
+
+    // No matching token -> fall back to WAVE_MAPPER (null).
+    try expect(selectAudioDevice(&names, "XY", null) == null);
+}
+
+test "selectAudioDevice: honours an explicit override substring" {
+    const names = [_][]const u8{
+        "Speakers (FxSound Audio Enhancer)",
+        "Headphones (WF-1000XM5 Stereo)",
+        "Realtek HD Audio",
+    };
+    // Override wins regardless of the BT name, and may even target FxSound if
+    // the user explicitly asks for it.
+    try expectEqual(@as(usize, 2), selectAudioDevice(&names, "WF-1000XM5", "realtek").?);
+    // Override with no match -> null (do not silently fall back to token match).
+    try expect(selectAudioDevice(&names, "WF-1000XM5", "nonexistent") == null);
+}
+
+test "WAVEOUTCAPSW: layout size matches the Win32 struct (84 bytes)" {
+    try expectEqual(@as(usize, 84), @sizeOf(WAVEOUTCAPSW));
+}
+
+test "SilentKeepalive: init resolves to WAVE_MAPPER default endpoint" {
+    var ka = SilentKeepalive.init();
+    defer ka.stop();
+    try expectEqual(WAVE_MAPPER, ka.device_id);
+    try expect(ka.override_name == null);
 }
