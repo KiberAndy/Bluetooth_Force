@@ -509,6 +509,14 @@ const BthApi = struct {
         hFind: ?*anyopaque,
     ) callconv(WINAPI) i32,
 
+    // R1 — programmatic radio reset ("software re-plug"). Optional so a system
+    // whose bthprops.cpl lacks this export still loads the rest of the API
+    // (R1 then simply stays dormant instead of killing the whole app).
+    BluetoothEnableIncomingConnections: ?*const fn (
+        hRadio: ?*anyopaque,
+        fEnabled: i32,
+    ) callconv(WINAPI) i32,
+
     module: ?*anyopaque,
 };
 
@@ -543,6 +551,13 @@ fn loadBthApi() !BthApi {
         @ptrCast(GetProcAddress(module, "BluetoothFindDeviceClose") orelse return error.BthApiMissing),
     );
 
+    // R1 — resolved best-effort: missing export only disables the radio-reset
+    // layer, never the app (see BthApi.BluetoothEnableIncomingConnections).
+    const enableIncoming: ?*const fn (?*anyopaque, i32) callconv(WINAPI) i32 = if (GetProcAddress(module, "BluetoothEnableIncomingConnections")) |p|
+        @as(*const fn (?*anyopaque, i32) callconv(WINAPI) i32, @ptrCast(p))
+    else
+        null;
+
     return BthApi{
         .BluetoothFindFirstRadio = findFirstRadio,
         .BluetoothFindNextRadio = findNextRadio,
@@ -550,6 +565,7 @@ fn loadBthApi() !BthApi {
         .BluetoothFindFirstDevice = findFirstDevice,
         .BluetoothFindNextDevice = findNextDevice,
         .BluetoothFindDeviceClose = findDeviceClose,
+        .BluetoothEnableIncomingConnections = enableIncoming,
         .module = module,
     };
 }
@@ -557,19 +573,19 @@ fn loadBthApi() !BthApi {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const POLL_INTERVAL_MS: u32 = 2000;
+pub const POLL_INTERVAL_MS: u32 = 2000;
 const RESUME_DELAY_MS: u32 = 3000;
 
 // L3 — connect (ToothTray) backoff while the earbuds are unreachable. Capped at
 // 4s so a case-open still reconnects within ~one poll, but we stop hammering BT
 // while the earbuds are away. Reset to 0 on a successful connect.
-const CONNECT_BACKOFF_BASE_MS: u32 = 500;
-const CONNECT_BACKOFF_CAP_MS: u32 = 4000;
+pub const CONNECT_BACKOFF_BASE_MS: u32 = 500;
+pub const CONNECT_BACKOFF_CAP_MS: u32 = 4000;
 
 // L5 — circuit breaker for ToothTray spawns (worker thread only).
-const CONNECT_CB_WINDOW_MS: i64 = 10_000;
-const CONNECT_CB_MAX_SPAWNS: u32 = 20;
-const CONNECT_CB_COOLDOWN_MS: i64 = 30_000;
+pub const CONNECT_CB_WINDOW_MS: i64 = 10_000;
+pub const CONNECT_CB_MAX_SPAWNS: u32 = 20;
+pub const CONNECT_CB_COOLDOWN_MS: i64 = 30_000;
 
 // L6 — paged-pool watchdog. The diagnosed leak climbs by gigabytes; 800MB over
 // the lowest-seen baseline is far above normal fluctuation yet trips long before
@@ -584,6 +600,44 @@ const WATCHDOG_CLEAR_BYTES: u64 = 200 * 1024 * 1024;
 const WATCHDOG_FORCE_CLEAR_MS: i64 = 30 * 60 * 1000;
 // Heartbeat log cadence while the watchdog stays tripped (visibility).
 const WATCHDOG_LOG_INTERVAL_MS: i64 = 60 * 1000;
+
+// R1 — programmatic radio reset ("software re-plug") tuning.
+//
+// TRIGGER. The only reliably observable state is "target remembered but not
+// connected" (found && !fConnected) — and it is IDENTICAL for two very
+// different situations: earbuds powered off in their case, and earbuds powered
+// on and paging at a wedged radio that cannot answer their pages (the exact
+// user-reported bug). ToothTray's exit code cannot separate them either:
+// ToothTray connect is a one-shot KSPROPERTY_ONESHOT_RECONNECT poke at the BT
+// audio driver (see m2jean/ToothTray, BluetoothAudioDevices.cpp) — it does not
+// wait for the link, so the spawn "succeeds" (exit 0) regardless of whether
+// the device is reachable. Therefore the recovery window arms on the FIRST
+// stop_and_connect observation of the absence episode and fires after
+// R1_ARM_MS of continuous absence — slow first-time connections are unaffected
+// because a healthy case-open connects in ~3s, well under the window.
+//
+// STORM CAP. Absence also covers "earbuds resting in their case", so the
+// trigger alone would toggle forever. The hard cap reuses the tested L5
+// CircuitBreaker primitive (unmodified): at most R1_CB_MAX_RESETS resets per
+// R1_CB_WINDOW_MS — after a burst of 3, the radio is left alone for 10
+// minutes. Worst-case cost while the earbuds rest all day: 3 harmless 300ms
+// page-scan toggles per 10 minutes (established links are unaffected by scan
+// state; only NEW incoming BR/EDR connections pause for 300ms).
+pub const R1_ARM_MS: i64 = 20_000;
+pub const R1_COOLDOWN_MS: i64 = 60_000;
+// R1 hard cap — a fresh CircuitBreaker instance (L5 primitive, not modified).
+pub const R1_CB_WINDOW_MS: i64 = 10 * 60 * 1000;
+pub const R1_CB_MAX_RESETS: u32 = 3;
+pub const R1_CB_COOLDOWN_MS: i64 = 10 * 60 * 1000;
+// How long the radio stays "disabled" inside the toggle before re-enabling.
+const R1_TOGGLE_QUIET_MS: u32 = 300;
+// Re-enable is the one step that must not fail silently: if it did, the
+// adapter would stay non-connectable (worse than the wedge itself). Retry hard.
+const R1_REENABLE_ATTEMPTS: u32 = 5;
+const R1_REENABLE_RETRY_MS: u32 = 100;
+// Settle time after a successful reset before the next ToothTray attempt —
+// one poll cycle for the controller to re-arm its page scan.
+pub const R1_POST_RESET_RECONNECT_MS: i64 = 2_000;
 
 const WINDOW_CLASS_NAME: [*:0]const u16 = &[_:0]u16{ 'B', 't', 'F', 'o', 'r', 'c', 'e', 'W', 'i', 'n', 'd', 'o', 'w' };
 const WINDOW_TITLE: [*:0]const u16 = &[_:0]u16{ 'B', 't', 'F', 'o', 'r', 'c', 'e' };
@@ -879,6 +933,17 @@ const SharedState = struct {
     watchdog_tripped: bool = false,
     watchdog_tripped_ms: i64 = 0,
     watchdog_last_log_ms: i64 = 0,
+    // R1 — radio-reset ("software re-plug") state. r1_armed_ms == 0 is the
+    // "not armed" sentinel; safe because GetTickCount64 never returns 0 for a
+    // user-started process. r1_last_reset_ms == 0 means "no reset yet". The
+    // breaker is the hard storm cap (see the R1 constants comment).
+    r1_armed_ms: i64 = 0,
+    r1_last_reset_ms: i64 = 0,
+    r1_breaker: CircuitBreaker = .{
+        .window_ms = R1_CB_WINDOW_MS,
+        .max_events = R1_CB_MAX_RESETS,
+        .cooldown_ms = R1_CB_COOLDOWN_MS,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -967,7 +1032,7 @@ fn quoteArgInto(buf: []u8, arg: []const u8) ![]u8 {
 
 // L3 — Exponential backoff with a hard cap. failures==0 -> 0 (happy path, no
 // delay). Pure.
-fn backoffMs(consecutive_failures: u32, base_ms: u32, cap_ms: u32) u32 {
+pub fn backoffMs(consecutive_failures: u32, base_ms: u32, cap_ms: u32) u32 {
     if (consecutive_failures == 0) return 0;
     var v: u64 = base_ms;
     var i: u32 = 1;
@@ -984,7 +1049,7 @@ fn backoffMs(consecutive_failures: u32, base_ms: u32, cap_ms: u32) u32 {
 // exceeds max_events the circuit OPENS for cooldown_ms, during which allow()
 // returns false. Makes a runaway registration storm physically impossible.
 // Single-threaded per instance.
-const CircuitBreaker = struct {
+pub const CircuitBreaker = struct {
     window_ms: i64,
     max_events: u32,
     cooldown_ms: i64,
@@ -993,7 +1058,7 @@ const CircuitBreaker = struct {
     tripped_until_ms: i64 = 0,
     trip_count: u32 = 0,
 
-    fn allow(self: *CircuitBreaker, now_ms: i64) bool {
+    pub fn allow(self: *CircuitBreaker, now_ms: i64) bool {
         if (now_ms < self.tripped_until_ms) return false;
         if (now_ms - self.window_start_ms >= self.window_ms) {
             self.window_start_ms = now_ms;
@@ -1019,6 +1084,17 @@ const CircuitBreaker = struct {
 // lowest-seen baseline by more than threshold_bytes. Pure.
 fn watchdogTripped(min_baseline_bytes: u64, current_bytes: u64, threshold_bytes: u64) bool {
     return current_bytes > min_baseline_bytes and (current_bytes - min_baseline_bytes) > threshold_bytes;
+}
+
+// R1 — Should the worker perform the programmatic radio reset now? Pure.
+// armed_ms == 0 is the "not armed" sentinel. last_reset_ms == 0 means "no
+// reset performed yet" (and can never collide with a real timestamp for the
+// same reason as above).
+pub fn shouldRadioReset(armed_ms: i64, now_ms: i64, last_reset_ms: i64) bool {
+    if (armed_ms == 0) return false;
+    if (now_ms - armed_ms < R1_ARM_MS) return false;
+    if (last_reset_ms != 0 and now_ms - last_reset_ms < R1_COOLDOWN_MS) return false;
+    return true;
 }
 
 // Case-insensitive ASCII substring test (allocation-free). Non-ASCII bytes
@@ -1281,7 +1357,7 @@ const PollAction = enum {
     stop_and_connect,
 };
 
-fn decidePollAction(found: bool, fConnected: i32) PollAction {
+pub fn decidePollAction(found: bool, fConnected: i32) PollAction {
     if (!found) return .none;
     if (fConnected != 0) return .start_keepalive;
     return .stop_and_connect;
@@ -1375,6 +1451,7 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // endpoint-targeted keepalive — unless the watchdog paused us.
                     state.connect_fails = 0;
                     state.next_connect_ms = 0;
+                    state.r1_armed_ms = 0; // R1 — link is up, wedge is moot
                     if (!state.watchdog_tripped) state.silent.start(name);
                     return;
                 },
@@ -1385,6 +1462,35 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     if (state.watchdog_tripped) return;
 
                     const now = nowMs();
+
+                    // R1 — wedge recovery, checked on EVERY entry into this
+                    // branch (ahead of the L3 backoff gate): a wedged radio must
+                    // not have its cure delayed by the retry clock.
+                    //
+                    // Arm on the first observation of the absence episode.
+                    // "Remembered but not connected" is the same observable for
+                    // earbuds resting in their case and earbuds paging at a
+                    // wedged radio (ToothTray's one-shot connect succeeds either
+                    // way), so absence-duration is the only usable trigger. The
+                    // CircuitBreaker below is what keeps resting-earbuds cost
+                    // bounded (max 3 resets per 10 minutes, then silence).
+                    if (state.r1_armed_ms == 0) state.r1_armed_ms = now;
+                    if (shouldRadioReset(state.r1_armed_ms, now, state.r1_last_reset_ms) and
+                        state.r1_breaker.allow(now))
+                    {
+                        // Rate-limit the whole procedure regardless of outcome.
+                        state.r1_last_reset_ms = now;
+                        if (radioReset(state, rh)) {
+                            // Fresh start against the revived radio: clear the
+                            // failure backoff and give the stack one poll cycle
+                            // to settle before reconnecting.
+                            state.connect_fails = 0;
+                            state.next_connect_ms = now + R1_POST_RESET_RECONNECT_MS;
+                            return;
+                        }
+                        debug("R1: reset attempt failed; will retry after cooldown", .{});
+                    }
+
                     if (now < state.next_connect_ms) return; // L3 backoff window
                     if (!state.tt_breaker.allow(now)) { // L5 circuit breaker
                         debug("connect circuit OPEN — cooling down", .{});
@@ -1402,11 +1508,19 @@ fn performPoll(state: *SharedState, _: u32) !void {
                                     CONNECT_BACKOFF_BASE_MS,
                                     CONNECT_BACKOFF_CAP_MS,
                                 );
+                                // R1 note: ToothTray failures intentionally do
+                                // NOT arm the recovery window — the one-shot
+                                // connect succeeds (exit 0) even for unreachable
+                                // devices, so exit codes carry no wedge signal.
                             },
                         }
                         return;
                     };
                     // Spawn succeeded and ToothTray reported success.
+                    // R1 note: this is NOT treated as a link — ToothTray's
+                    // one-shot connect returns 0 even when the device is
+                    // unreachable, so only start_keepalive (a real link seen
+                    // by the poll) disarms the recovery window.
                     state.connect_fails = 0;
                     state.next_connect_ms = 0;
                     return;
@@ -1419,6 +1533,53 @@ fn performPoll(state: *SharedState, _: u32) !void {
         radio_handle = null;
         if (state.bth.BluetoothFindNextRadio(radio_find, &radio_handle) == 0) break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// R1 — programmatic radio reset ("software re-plug")
+// ---------------------------------------------------------------------------
+// Symptom this treats: after an ugly disconnect (or a failed USB selective
+// suspend wake) the radio/stack can wedge with a stuck page-scan state —
+// outgoing connects fail and incoming pages from the earbuds go unanswered,
+// so the poll loop retries forever into a dead end. The user's workaround —
+// physically unplug/replug the dongle — resets the controller's scan state.
+// This is the software equivalent, done through the documented bthprops.cpl
+// API already loaded for the poll loop:
+//   BluetoothEnableIncomingConnections(hRadio, false)  ->  quiet pause
+//   BluetoothEnableIncomingConnections(hRadio, true)
+// Disabling forces the stack to rewrite the controller's scan-enable state on
+// re-enable, which re-arms page scan. No admin rights, no driver reload.
+// A failed re-enable would leave the adapter non-connectable (worse than the
+// wedge), so that step is retried hard before giving up.
+fn radioReset(state: *SharedState, hRadio: ?*anyopaque) bool {
+    const enableIncoming = state.bth.BluetoothEnableIncomingConnections orelse {
+        debug("R1: BluetoothEnableIncomingConnections unavailable, reset skipped", .{});
+        return false;
+    };
+    debug("R1: radio reset begin (page-scan toggle)", .{});
+    if (enableIncoming(hRadio, 0) == 0) {
+        // Nothing was changed: the wedge state is untouched and the normal
+        // retry cadence continues untouched.
+        debug("R1: disable failed 0x{x}, radio left as-is", .{GetLastError()});
+        return false;
+    }
+    Sleep(R1_TOGGLE_QUIET_MS);
+    var reenabled = false;
+    var attempt: u32 = 0;
+    while (attempt < R1_REENABLE_ATTEMPTS) : (attempt += 1) {
+        if (attempt > 0) Sleep(R1_REENABLE_RETRY_MS);
+        if (enableIncoming(hRadio, 1) != 0) {
+            reenabled = true;
+            break;
+        }
+        debug("R1: re-enable attempt {}/{} failed 0x{x}", .{ attempt + 1, R1_REENABLE_ATTEMPTS, GetLastError() });
+    }
+    if (!reenabled) {
+        debug("R1: RE-ENABLE FAILED after retries — adapter may stay non-connectable until next reset or replug", .{});
+        return false;
+    }
+    debug("R1: radio reset complete", .{});
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2731,6 +2892,62 @@ test "watchdogTripped: only trips when growth over baseline exceeds threshold" {
     try expect(watchdogTripped(100 * mb, 901 * mb, 800 * mb));
     // current below baseline can never trip (no underflow).
     try expect(!watchdogTripped(500 * mb, 100 * mb, 800 * mb));
+}
+
+test "shouldRadioReset: never fires while unarmed (healthy path)" {
+    // Healthy machines never arm the recovery window -> R1 stays dormant
+    // forever, no matter how much time passes or how many resets happened.
+    try expect(!shouldRadioReset(0, 0, 0));
+    try expect(!shouldRadioReset(0, 86_400_000, 0));
+    try expect(!shouldRadioReset(0, 86_400_000, 86_000_000));
+}
+
+test "shouldRadioReset: fires only after the arm window elapses" {
+    const armed: i64 = 1_000;
+    // One millisecond short of the window -> still wait.
+    try expect(!shouldRadioReset(armed, armed + R1_ARM_MS - 1, 0));
+    // Window fully elapsed -> fire (no previous reset to rate-limit).
+    try expect(shouldRadioReset(armed, armed + R1_ARM_MS, 0));
+}
+
+test "shouldRadioReset: cooldown enforces at most one reset per minute" {
+    const armed: i64 = 1_000;
+    const last: i64 = armed + R1_ARM_MS; // first reset fired here
+    // One millisecond short of the cooldown -> suppress.
+    try expect(!shouldRadioReset(armed, last + R1_COOLDOWN_MS - 1, last));
+    // Cooldown fully elapsed -> fire again (S6 degradation path: 1/minute).
+    try expect(shouldRadioReset(armed, last + R1_COOLDOWN_MS, last));
+}
+
+test "shouldRadioReset: sentinel last_reset_ms allows the very first reset" {
+    // last_reset_ms == 0 must not be treated as "reset just happened".
+    try expect(shouldRadioReset(1_000, 1_000 + R1_ARM_MS, 0));
+    // And armed_ms == 0 always suppresses, regardless of the other args.
+    try expect(!shouldRadioReset(0, 1_000 + R1_ARM_MS, 0));
+}
+
+test "R1 breaker: hard-caps the storm at 3 resets per 10-minute window" {
+    // The R1 breaker is a stock CircuitBreaker (L5 primitive) with the R1
+    // constants. Three resets inside one window are allowed, the fourth call
+    // trips it and silences R1 for the rest of the window. This cap is what
+    // makes the absence-based trigger safe for earbuds resting in their case.
+    var r1 = CircuitBreaker{
+        .window_ms = R1_CB_WINDOW_MS,
+        .max_events = R1_CB_MAX_RESETS,
+        .cooldown_ms = R1_CB_COOLDOWN_MS,
+    };
+    const t0: i64 = 60_000;
+    try expect(r1.allow(t0)); // reset #1
+    try expect(r1.allow(t0 + 60_000)); // reset #2
+    try expect(r1.allow(t0 + 120_000)); // reset #3
+    const trip_at = t0 + 180_000;
+    try expect(!r1.allow(trip_at)); // 4th -> trip, radio left alone
+    try expect(r1.isTripped(trip_at + R1_CB_COOLDOWN_MS - 1));
+    // Cooldown (counted from the trip) fully elapsed -> fresh budget of three.
+    try expect(r1.allow(trip_at + R1_CB_COOLDOWN_MS));
+    try expect(r1.allow(trip_at + R1_CB_COOLDOWN_MS + 60_000));
+    try expect(r1.allow(trip_at + R1_CB_COOLDOWN_MS + 120_000));
+    try expect(!r1.allow(trip_at + R1_CB_COOLDOWN_MS + 180_000));
 }
 
 test "containsIgnoreCase / isFxSoundName: case-insensitive matching" {
