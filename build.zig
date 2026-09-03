@@ -4,7 +4,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
 
-    const libs = [_][]const u8{ "user32", "winmm" };
+    // setupapi/cfgmgr32 — R2 usb-cycle (device disable/enable);
+    // shell32 — IsUserAnAdmin gate for the escalation rung.
+    const libs = [_][]const u8{ "user32", "winmm", "setupapi", "cfgmgr32", "shell32" };
 
     const exe = b.addExecutable(.{
         .name = "bluetooth_force",
