@@ -53,6 +53,14 @@ extern "kernel32" fn WaitForSingleObject(
 
 extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(WINAPI) i32;
 
+extern "kernel32" fn CreateMutexW(
+    lpMutexAttributes: ?*anyopaque,
+    bInitialOwner: i32,
+    lpName: [*:0]const u16,
+) callconv(WINAPI) ?*anyopaque;
+
+const ERROR_ALREADY_EXISTS: u32 = 183;
+
 extern "kernel32" fn ExitProcess(uExitCode: u32) callconv(WINAPI) noreturn;
 
 extern "kernel32" fn FreeLibrary(hModule: ?*anyopaque) callconv(WINAPI) i32;
@@ -170,6 +178,58 @@ extern "setupapi" fn SetupDiDestroyDeviceInfoList(
     DeviceInfoSet: ?*anyopaque,
 ) callconv(WINAPI) i32;
 
+// r2-l7 -- hub enumeration for the R4 port power-cycle: find the USB hub
+// device paths (GUID_DEVINTERFACE_USB_HUB) so we can open each hub and ask
+// it, port by port, what hangs off it.
+extern "setupapi" fn SetupDiEnumDeviceInterfaces(
+    DeviceInfoSet: ?*anyopaque,
+    DeviceInfoData: ?*SP_DEVINFO_DATA,
+    InterfaceClassGuid: *const GUID,
+    MemberIndex: u32,
+    DeviceInterfaceData: *SP_DEVICE_INTERFACE_DATA,
+) callconv(WINAPI) i32;
+
+extern "setupapi" fn SetupDiGetDeviceInterfaceDetailW(
+    DeviceInfoSet: ?*anyopaque,
+    DeviceInterfaceData: *SP_DEVICE_INTERFACE_DATA,
+    DeviceInterfaceDetailData: ?*anyopaque,
+    DeviceInterfaceDetailDataSize: u32,
+    RequiredSize: ?*u32,
+    DeviceInfoData: ?*SP_DEVINFO_DATA,
+) callconv(WINAPI) i32;
+
+// r2-l7 -- the R4 rung talks to hub PDOs directly. No TerminateProcess
+// analogue here: a completed DeviceIoControl either cycled the port or it
+// did not; the verification polls below are what turn the receipt into a
+// state change (r1-l8 lesson, applied again).
+extern "kernel32" fn DeviceIoControl(
+    hDevice: ?*anyopaque,
+    dwIoControlCode: u32,
+    lpInBuffer: ?*const anyopaque,
+    nInBufferSize: u32,
+    lpOutBuffer: ?*anyopaque,
+    nOutBufferSize: u32,
+    lpBytesReturned: *u32,
+    lpOverlapped: ?*anyopaque,
+) callconv(WINAPI) i32;
+
+const SP_DEVICE_INTERFACE_DATA = extern struct {
+    cbSize: u32,
+    InterfaceClassGuid: GUID,
+    Flags: u32,
+    Reserved: usize,
+};
+const DIGCF_DEVICEINTERFACE: u32 = 0x00000010;
+const FILE_SHARE_READ: u32 = 0x00000001;
+const FILE_SHARE_WRITE: u32 = 0x00000002;
+const OPEN_EXISTING: u32 = 3;
+// SP_DEVICE_INTERFACE_DETAIL_DATA_W is variable-length (cbSize + path).
+// We build it by hand in a stack buffer: u32 cbSize (= 8 on x64, the ABI
+// tag setupapi expects) followed by the null-terminated UTF-16 path at
+// byte offset 4. No struct — the path length comes from RequiredSize.
+const IFDETAIL_CB_SIZE_X64: u32 = 8;
+const IFDETAIL_PATH_OFFSET: usize = 4;
+
 /// CONFIGRET (u32): CR_SUCCESS == 0.
 extern "cfgmgr32" fn CM_Get_DevNode_Status(
     ulStatus: *u32,
@@ -260,6 +320,14 @@ const GUID_DEVCLASS_AUDIOENDPOINT = GUID{
     .Data2 = 0x70e5,
     .Data3 = 0x41c9,
     .Data4 = .{ 0x8a, 0xc9, 0x8f, 0xf1, 0x03, 0xba, 0x2a, 0xa1 },
+};
+// USB hub device interface {F18A0E88-C30C-11D0-8815-00A0C906BED8} — the
+// R4 rung opens one of these per hub to enumerate ports (r2-l7).
+const GUID_DEVINTERFACE_USB_HUB = GUID{
+    .Data1 = 0xf18a0e88,
+    .Data2 = 0xc30c,
+    .Data3 = 0x11d0,
+    .Data4 = .{ 0x88, 0x15, 0x00, 0xa0, 0xc9, 0x06, 0xbe, 0xd8 },
 };
 // Config-manager flags for the re-enumeration wait.
 const DN_HAS_PROBLEM: u32 = 0x00000400;
@@ -946,6 +1014,15 @@ const R1_REENABLE_RETRY_MS: u32 = 100;
 // Settle time after a successful reset before the next ToothTray attempt —
 // one poll cycle for the controller to re-arm its page scan.
 pub const R1_POST_RESET_RECONNECT_MS: i64 = 2_000;
+// r2-l5 — FLAP HYSTERESIS (field 2026-09-04: a chronic link flap reset the
+// absence episode on every lone connected poll, so the rungs never armed
+// while the earbuds kept dropping). The episode now closes only after
+// LINK_STABLE_POLLS_TO_CLOSE consecutive connected polls; a lone connected
+// blip inside an armed episode counts as a flap instead of a cure. After
+// FLAP_FORCE_R1_AFTER flaps the R1 arm is backdated so the soft rung fires
+// immediately — ladder order (R1 -> R3 -> R2) is preserved.
+pub const LINK_STABLE_POLLS_TO_CLOSE: u32 = 3;
+pub const FLAP_FORCE_R1_AFTER: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // R2 — usb-cycle ("hardware re-plug") — the escalation rung of the ladder.
@@ -998,7 +1075,29 @@ const R2_ENABLE_VERIFY_MS: u32 = 2_500; // observe DN_STARTED per enable path
 // enable step never completed. Everything below exists to make that state
 // impossible to reach, and self-healing if it is somehow reached anyway.
 const RECOVERY_JOURNAL_NAME = "btf_pending_enable.txt";
-pub const RECOVERY_RETRY_MS: i64 = 5_000; // repairs are NOT rate-limited like escalations
+    pub const RECOVERY_RETRY_MS: i64 = 5_000; // repairs are NOT rate-limited like escalations
+    // r2-l9 -- the repair rung must not hammer PnP every 5 s forever (field
+    // 2026-09-04 23:19: a 3010-STOPPED radio plus a ~6 s enable storm that
+    // vetoed the whole USB tree and took Explorer down with it). Consecutive
+    // FAILED passes back off exponentially toward the cap; after
+    // RECOVERY_QUIET_AFTER of them the rung prints REBOOT REQUIRED once and
+    // goes quiet at the cap (the journal stays armed across the reboot).
+    // The cap is 60 s, not minutes: a replugged dongle must be noticed
+    // within about a minute even under deep backoff (the presence
+    // transition below resets the clock outright, so 60 s is the worst
+    // case, not the common one). One SetupDi+enable probe a minute is two
+    // orders of magnitude below the 6 s storm that vetoed the USB tree.
+    pub const RECOVERY_BACKOFF_CAP_MS: i64 = 60_000; // 1 min
+    pub const RECOVERY_QUIET_AFTER: u32 = 10;
+    pub fn recoveryRetryDelayMs(consec_fails: u32) i64 {
+        var d: i64 = RECOVERY_RETRY_MS;
+        var i: u32 = 0;
+        while (i < consec_fails) : (i += 1) {
+            if (d >= @divTrunc(RECOVERY_BACKOFF_CAP_MS, 2)) return RECOVERY_BACKOFF_CAP_MS;
+            d *= 2;
+        }
+        return d;
+    }
 const RECOVERY_VERIFY_MS: u32 = 3_000;
 // r2-l4 -- pnputil exit codes we must not read as success.
 // 3010 = ERROR_SUCCESS_REBOOT_REQUIRED: the node was STOPPED and can not
@@ -1019,6 +1118,122 @@ pub const R2_POST_CYCLE_RECONNECT_MS: i64 = 2_000;
 // The dongle this build cycles: CSR-based BT radio (user's hardware).
 const R2_MATCH_VID: []const u8 = "vid_0a12";
 const R2_MATCH_PID: []const u8 = "pid_0001";
+
+// ---------------------------------------------------------------------------
+// R4 — hub port power-cycle (r2-l7). The rung ABOVE the usb-cycle.
+//
+// FORENSIC BASIS (field 2026-09-04 14:15): the full ladder ran — R1 rejected
+// x3 then muted, R3 restarted 2/2 audio nodes (complete), R2 completed via
+// pnputil /restart-device (exit 0, devnode verified STARTED) — and the wedge
+// survived. A verified restart receipt is not a cure (same lesson as r1-l8):
+// the CSR firmware can wedge BELOW the USB HCI function, where no PnP
+// restart reaches. Only a VBUS drop — what the physical replug does —
+// resets that layer. R4 sends IOCTL_USB_HUB_CYCLE_PORT to the hub port the
+// dongle hangs off, simulating a physical unplug/replug on that port ONLY:
+// every other USB device (hubs, disks, other radios) is untouched.
+//
+// ORDER: R4 fires only after a VERIFIED R2 completion inside the same
+// episode proved useless (r2_cycled_in_episode) — escalation, never
+// replacement. If R2 muted itself (3010 reboot-required), the radio is
+// STOPPED and the repair rung owns it; a port cycle can not fix a state
+// that needs a reboot, so R4 stays dormant. Storm cap mirrors R2 (2 per
+// 10 min) with a wider min interval: a port cycle re-enumerates the whole
+// BT stack on the machine for several seconds.
+pub const R4_ARM_MS: i64 = 90_000;
+pub const R4_MIN_INTERVAL_MS: i64 = 300_000;
+pub const R4_CB_WINDOW_MS: i64 = 10 * 60 * 1000;
+pub const R4_CB_MAX_PORTCYCLES: u32 = 2;
+pub const R4_CB_COOLDOWN_MS: i64 = 10 * 60 * 1000;
+// Settle time after a verified port cycle before the next ToothTray attempt.
+pub const R4_POST_CYCLE_RECONNECT_MS: i64 = 2_000;
+// How long to wait for the dongle to re-enumerate after the port cycle.
+const R4_REENUM_VERIFY_MS: u32 = 10_000;
+const R4_REENUM_POLL_MS: u32 = 250;
+// After this many port cycles that left the link down, the rung mutes for
+// the run: same policy as R2 (r2-l4) — a rung that can only churn must stop.
+const R4_DEAD_FAILURES: u32 = 2;
+// USB hub IOCTLs (usbioctl.h): FILE_DEVICE_USB=0x22, METHOD_BUFFERED,
+// FILE_ANY_ACCESS. CTL_CODE = (0x22<<16)|(Function<<2).
+const IOCTL_USB_GET_NODE_INFORMATION: u32 = 0x220408; // Function 258
+const IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX: u32 = 0x220484; // Function 289
+// Non-EX variant (Function 259): the fallback USBView itself uses when EX
+// is not supported (field 2026-09-04: hub #1 rejects EX with 0x32 on
+// EVERY port, hub #2 answers EX with success + 0 bytes).
+const IOCTL_USB_GET_NODE_CONNECTION_INFORMATION: u32 = 0x22040C; // Function 259
+// Non-EX ConnectionStatus offset: the non-EX reply packs one byte
+// tighter than the EX struct (no pad after DeviceIsHub: DeviceAddress
+// U16 lives at 25, NumberOfOpenPipes U32 at 27), so ConnectionStatus
+// sits at 31, not 32. PROVEN empirically 2026-09-04 (probe hexdump,
+// six devices incl. the CSR dongle): bytes 22..39 on hub #1 port 3
+// were 01 00 00 0a 00 05 00 00 00 01 00 00 00 07 05 81 03 10 —
+// @22 cfg=01, @24 ishub=00, @25 addr=0a, @27 pipes=05 00 00 00,
+// @31 status=01 00 00 00 (DeviceConnected), @35+ pipe list
+// (05 81 03.. = endpoint 0x81 interrupt). Reading @32 instead yields
+// 0x07000000 on every port — six for six. VID/PID offsets (12/14)
+// are identical in both variants (verified against known devices:
+// 0bda/b711 Realtek, 05e3/0608 Genesys hub with ishub=01).
+const NONEX_CONN_STATUS_OFFSET: usize = 31;
+const IOCTL_USB_HUB_CYCLE_PORT: u32 = 0x220488; // Function 290
+const USB_HUB_NODE: u32 = 0; // USB_HUB_NODE enum: UsbHub
+const USB_DEVICE_CONNECTED: u32 = 1; // USB_CONNECTION_STATUS: DeviceConnected
+const CSR_VID: u16 = 0x0A12;
+const CSR_PID: u16 = 0x0001;
+// Minimal prefix of USB_NODE_INFORMATION (hub variant): NodeType + the
+// first three bytes of the hub descriptor. Layout asserted by test.
+// USB 2.0 sect 11.23.2.1: the hub descriptor packs bDescLength@0,
+// bDescriptorType@1, bNumberOfPorts@2, wHubCharacteristics u16LE@3.
+// The descriptor starts at raw offset 4 (after NodeType u32), so
+// wHubCharacteristics sits at raw offset 7. Bits 1:0 = power switching
+// mode: 00 ganged (one switch for all ports), 01 individual (per-port
+// switch — the ONLY kind a program can power-cycle), 1x none (VBUS
+// hard-wired, no software at ANY level can cut it — physics, not
+// privilege). Read straight from the roomy node_buf, same as bNbrPorts.
+const USB_NODE_INFO_PREFIX = extern struct {
+    NodeType: u32,
+    bDescLength: u8,
+    bDescriptorType: u8,
+    bNbrPorts: u8,
+};
+// Raw offset of wHubCharacteristics in the GET_NODE_INFORMATION reply.
+const HUB_CHARS_OFFSET: usize = 7;
+/// Decode the power-switching mode from wHubCharacteristics (pure, tested).
+fn hubPowerMode(chars: u16) []const u8 {
+    return switch (chars & 3) {
+        0 => "ganged",
+        1 => "individual",
+        else => "none",
+    };
+}
+// Fixed prefix of USB_NODE_CONNECTION_INFORMATION_EX. The PipeList tail is
+// variable-length; the buffer we hand the driver holds 32 pipes, we only
+// ever read the prefix. Size asserted by test (36 bytes, C layout).
+const USB_CONN_INFO_PREFIX = extern struct {
+    ConnectionIndex: u32,
+    bLength: u8,
+    bDescriptorType: u8,
+    bcdUSB: u16,
+    bDeviceClass: u8,
+    bDeviceSubClass: u8,
+    bDeviceProtocol: u8,
+    bMaxPacketSize0: u8,
+    idVendor: u16,
+    idProduct: u16,
+    bcdDevice: u16,
+    iManufacturer: u8,
+    iProduct: u8,
+    iSerialNumber: u8,
+    bNumConfigurations: u8,
+    CurrentConfigValue: u8,
+    Speed: u8,
+    DeviceIsHub: u8,
+    DeviceAddress: u16,
+    NumberOfOpenPipes: u32,
+    ConnectionStatus: u32,
+};
+const USB_CYCLE_PORT_PARAMS = extern struct {
+    ConnectionIndex: u32,
+    StatusReturned: u32,
+};
 
 // ---------------------------------------------------------------------------
 // R3 — earbud-devnode restart (r2-l1). The rung that REPLACES the removed
@@ -1121,6 +1336,23 @@ const KEEPALIVE_CB_WINDOW_MS: i64 = 10_000;
 const KEEPALIVE_CB_MAX_OPENS: u32 = 30;
 const KEEPALIVE_CB_COOLDOWN_MS: i64 = 30_000;
 
+// r2-l6 -- H4 audio-dead detection: consecutive failed render sessions
+// while the BT link is enumerated connected mean the A2DP path is torn
+// down under a live control link (profile-level drop: fConnected stays
+// 1, waveOutOpen on the earbud endpoint fails). The keepalive worker
+// publishes the streak; the poll thread routes ONE poll through the
+// ladder (single-shot) when it reaches this threshold. stop() resets
+// the streak, so the restarted worker rebuilds it and re-fires while
+// the wedge persists — the ladder evaluates every few polls instead of
+// never. The threshold counts SESSIONS, not polls: the worker fails
+// faster (~500ms cadence) than the 2s poll, so detection lags the wedge
+// by seconds, well under the R1_ARM_MS window that still gates firing.
+// Blind spot (documented, H12 territory): when resolveDevice() falls
+// back to WAVE_MAPPER the sessions may succeed through the default
+// device while the earbuds' own A2DP path is dead — the streak then
+// stays 0 and this rung cannot see the wedge.
+pub const KEEPALIVE_DEAD_SESSIONS: u32 = 3;
+
 // A huge loop count makes the single keepalive buffer play effectively forever
 // (~46ms/buffer * 2^31 ≈ years), so the driver is touched once per session
 // instead of ~16x/second.
@@ -1161,6 +1393,10 @@ const SilentKeepalive = struct {
     override_name: ?[]const u8,
     // L5 — circuit breaker scoped to this (single) keepalive thread.
     breaker: CircuitBreaker,
+    // r2-l6 -- consecutive failed render sessions, published for the poll
+    // thread (H4 audio-dead signal). Written by the worker, read by the
+    // poll thread, reset by stop() and fresh start().
+    consec_fails: std.atomic.Value(u32),
 
     fn init() SilentKeepalive {
         var s = SilentKeepalive{
@@ -1175,6 +1411,7 @@ const SilentKeepalive = struct {
                 .max_events = KEEPALIVE_CB_MAX_OPENS,
                 .cooldown_ms = KEEPALIVE_CB_COOLDOWN_MS,
             },
+            .consec_fails = std.atomic.Value(u32).init(0),
         };
         fillKeepaliveBuffer(&s.silence_buf);
         return s;
@@ -1237,6 +1474,9 @@ const SilentKeepalive = struct {
 
     fn stop(self: *SilentKeepalive) void {
         self.want_run.store(false, .release);
+        // r2-l6 -- the streak belongs to the dead worker; a restarted
+        // worker rebuilds it from zero (H4 single-shot sensor reset).
+        self.consec_fails.store(0, .release);
         // Always join if we hold a thread handle, regardless of whether the
         // worker exited on its own (e.g. a waveOutOpen failure). This is what
         // prevents the std.Thread / OS thread-handle leak.
@@ -1267,6 +1507,8 @@ const SilentKeepalive = struct {
             } else {
                 fails +|= 1;
             }
+            // r2-l6 -- publish the streak for the poll thread (H4 signal).
+            self.consec_fails.store(fails, .release);
 
             if (self.want_run.load(.acquire)) {
                 const wait_ms = if (opened) 500 else backoffMs(fails, KEEPALIVE_BACKOFF_BASE_MS, KEEPALIVE_BACKOFF_CAP_MS);
@@ -1405,6 +1647,12 @@ const SharedState = struct {
     // R1_DEAD_REJECTIONS the rung is muted for the rest of the run.
     r1_rejects: u32 = 0,
     r1_dead_logged: bool = false,
+    // r2-l5 -- flap hysteresis: consecutive connected polls (the episode
+    // closes at LINK_STABLE_POLLS_TO_CLOSE) and connected blips observed
+    // inside an armed episode (they keep the episode armed instead of
+    // resetting it).
+    link_stable_polls: u32 = 0,
+    flaps_in_episode: u32 = 0,
     r1_breaker: CircuitBreaker = .{
         .window_ms = R1_CB_WINDOW_MS,
         .max_events = R1_CB_MAX_RESETS,
@@ -1435,11 +1683,47 @@ const SharedState = struct {
     recovery_last_ms: i64 = 0,
     recovery_attempts: u32 = 0,
     recovery_logged: bool = false,
+    // r2-l9 -- consecutive FAILED repair passes (backoff clock for
+    // recoveryRetryDelayMs) and the one-shot quiet flag: after
+    // RECOVERY_QUIET_AFTER of them the rung prints REBOOT REQUIRED once
+    // and retries at the cap instead of storming PnP.
+    recovery_fails: u32 = 0,
+    recovery_quiet_logged: bool = false,
+    // r2-l9 -- replug detector latch: set when a repair pass sees no CSR
+    // devnode, cleared (with a backoff reset) when one reappears.
+    recovery_saw_absent: bool = false,
+    // r2-l9 -- elevation comeback latch: same shape as the replug
+    // detector. Fresh rights are fresh evidence (the token check costs
+    // no PnP), so a 0 -> 1 transition resets the backoff outright
+    // instead of noticing the rights up to a cap interval later.
+    recovery_saw_unelevated: bool = false,
+    // r2-l9 -- consecutive ToothTray exit-2 ("device not found") outcomes.
+    // At PEER_ABSENT_FREEZE_AFTER the radio-destructive rungs (R2/R4)
+    // freeze until the peer returns or another outcome resets the streak.
+    peer_absent_streak: u32 = 0,
+    peer_absent_logged: bool = false,
     // r2-l4 -- the usb-cycle rung mutes itself after R2_DEAD_FAILURES
     // attempts that left the radio not started (field 2026-09-03: every
     // single attempt on this dongle was either a no-op or damage).
     r2_fails: u32 = 0,
     r2_dead_logged: bool = false,
+    // r2-l7 -- R4 escalation key: a VERIFIED R2 completion inside this
+    // episode (receipt, not cure — the 2026-09-04 14:15 field case). Set
+    // in the R2 success branch, cleared when a stable link closes the
+    // episode. R4 never fires without it.
+    r2_cycled_in_episode: bool = false,
+    // R4 — hub port power-cycle state. r4_last_ms == 0 means "no port
+    // cycle yet". Breaker mirrors R2 (2 per 10 min); the mute mirrors
+    // r2-l4 (2 useless cycles hush the rung for the run).
+    r4_last_ms: i64 = 0,
+    r4_admin_skip_logged: bool = false,
+    r4_fails: u32 = 0,
+    r4_dead_logged: bool = false,
+    r4_breaker: CircuitBreaker = .{
+        .window_ms = R4_CB_WINDOW_MS,
+        .max_events = R4_CB_MAX_PORTCYCLES,
+        .cooldown_ms = R4_CB_COOLDOWN_MS,
+    },
     r3_breaker: CircuitBreaker = .{
         .window_ms = R3_CB_WINDOW_MS,
         .max_events = R3_CB_MAX_RESTARTS,
@@ -1622,6 +1906,32 @@ pub fn shouldUsbCycle(
     return true;
 }
 
+// R4 — should the worker power-cycle the dongle's hub port now? Pure.
+// armed_ms == 0 is the "not armed" sentinel (same safety argument as
+// R1/R2). r2_cycled_in_episode is the escalation key: only a VERIFIED R2
+// completion inside this episode that left the link down unlocks R4 —
+// softer rungs get their chance first, and a 3010-muted R2 (radio STOPPED,
+// repair rung owns it) never unlocks a rung that can not help it.
+pub fn shouldHubPortCycle(
+    armed_ms: i64,
+    now_ms: i64,
+    r2_cycled_in_episode: bool,
+    last_portcycle_ms: i64,
+) bool {
+    if (armed_ms == 0) return false;
+    if (!r2_cycled_in_episode) return false;
+    if (now_ms - armed_ms < R4_ARM_MS) return false;
+    if (last_portcycle_ms != 0 and now_ms - last_portcycle_ms < R4_MIN_INTERVAL_MS) return false;
+    return true;
+}
+
+/// r2-l7 -- is the hub-port-cycle rung provably useless on this machine?
+/// Pure. Mirrors usbCycleRungDead (r2-l4): two port cycles that left the
+/// link down mute the rung for the run.
+pub fn hubPortCycleRungDead(portcycle_fails: u32) bool {
+    return portcycle_fails >= R4_DEAD_FAILURES;
+}
+
 // R3 — Should the worker restart the earbuds' own function devnodes now?
 // Pure. armed_ms == 0 is the "not armed" sentinel (same safety argument as
 // R1/R2) and it outranks every other input: nothing fires before an absence
@@ -1762,15 +2072,36 @@ fn selectAudioDevice(names: []const []const u8, bt_name: []const u8, override: ?
 // r2-l3 -- pure gates of the repair rung. Kept pure so the PoC harness and
 // the unit tests exercise the very same decisions the daemon makes.
 
-/// A repair is retried on a fixed short interval and is deliberately NOT
-/// subject to a circuit breaker: giving up on re-enabling the user's
+/// A repair is retried with exponential backoff (r2-l9) and is deliberately
+/// NOT subject to a circuit breaker: giving up on re-enabling the user's
 /// Bluetooth is never the safer option. Backwards clocks (DST, NTP step,
-/// sleep/resume) must not stall it either.
-pub fn shouldRetryRecovery(now: i64, last_attempt_ms: i64) bool {
+/// sleep/resume) must not stall it either. delay_ms comes from
+/// recoveryRetryDelayMs(state.recovery_fails): 5 s fresh, doubling toward
+/// the 5 min cap, so a 3010-STOPPED radio is retried eagerly at first and
+/// then quietly instead of storming PnP every 5 s forever.
+pub fn shouldRetryRecovery(now: i64, last_attempt_ms: i64, delay_ms: i64) bool {
     if (last_attempt_ms == 0) return true;
     if (now < last_attempt_ms) return true;
-    return now - last_attempt_ms >= RECOVERY_RETRY_MS;
+    return now - last_attempt_ms >= delay_ms;
 }
+
+/// r2-l9 -- ToothTray exit 2 ("device not found") in a series means the peer
+/// is gone (case closed / out of range), NOT the radio wedged. Tearing down
+/// the radio (R2/R4) cannot summon absent earbuds and risks another 3010 —
+/// so a streak of PEER_ABSENT_FREEZE_AFTER freezes the radio-destructive
+/// rungs. R1 (the soft page-scan cure) and R3 (narrow, self-no-oping on
+/// absent devnodes) keep running, because exit 2 is ALSO what a wedged
+/// radio looks like to ToothTray — freezing them could block the very cure.
+/// Any other ToothTray outcome (exit 0, timeout, other error) or a stable
+/// link resets the streak.
+pub const PEER_ABSENT_FREEZE_AFTER: u32 = 5;
+pub fn peerAbsentFreeze(consec_not_found: u32) bool {
+    return consec_not_found >= PEER_ABSENT_FREEZE_AFTER;
+}
+
+/// r2-l9 -- ToothTray's own "device not found" exit code, now propagated
+/// instead of folded into the generic failure (see triggerConnectionViaToothTray).
+pub const TOOTHTRAY_EXIT_NOT_FOUND: u32 = 2;
 
 /// The repair is only complete when the radio is actually there AND no
 /// matching devnode is left disabled. present == 0 means the dongle is
@@ -1828,15 +2159,22 @@ fn getSelfDir(buf: []u8) ![]u8 {
     return buf[0 .. dir_end + 1];
 }
 
+/// r2-l9 -- true while a ToothTray child from a previous poll is still
+/// running (its 15 s wait expired). Reaps a merely-stale handle exactly
+/// like the trigger head does, so a finished-but-unreaped child never
+/// blocks a rung. While true, NO rung may touch the driver/PnP: firing a
+/// page-scan toggle or a devnode restart mid-IOCTL is the veto-225 shape
+/// from the 2026-09-04 23:19 field case.
+fn toothTrayInFlight(state: *SharedState) bool {
+    const h = state.last_tooth_tray_handle orelse return false;
+    if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) return true;
+    _ = CloseHandle(h);
+    state.last_tooth_tray_handle = null;
+    return false;
+}
+
 fn triggerConnectionViaToothTray(state: *SharedState, device_name: []const u8) !void {
-    if (state.last_tooth_tray_handle) |h| {
-        const alive = WaitForSingleObject(h, 0);
-        if (alive == WAIT_TIMEOUT) {
-            return error.ToothTrayBusy;
-        }
-        _ = CloseHandle(h);
-        state.last_tooth_tray_handle = null;
-    }
+    if (toothTrayInFlight(state)) return error.ToothTrayBusy;
 
     // Resolve directory of bluetooth_force.exe (ToothTray.exe sits next to it)
     var dir_buf: [4096]u8 = undefined;
@@ -1897,6 +2235,14 @@ fn triggerConnectionViaToothTray(state: *SharedState, device_name: []const u8) !
     _ = CloseHandle(pi.hProcess);
     state.last_tooth_tray_handle = null;
 
+    if (exit_code == TOOTHTRAY_EXIT_NOT_FOUND) {
+        // r2-l9 -- "device not found" is a PEER verdict (case closed / out
+        // of range), not a radio verdict: it must not look like every
+        // other failure or the ladder cannot tell "peer gone" from
+        // "radio wedged".
+        debug("ToothTray: device not found (2) -- peer absent, not a radio verdict", .{});
+        return error.ToothTrayNotFound;
+    }
     if (exit_code != 0) {
         debug("ToothTray: failed, exit {}", .{exit_code});
         return error.ToothTrayFailed;
@@ -2103,21 +2449,58 @@ fn performPoll(state: *SharedState, _: u32) !void {
 
             // Route through the pure decision function so the tested logic and
             // the production logic can never drift apart.
-            switch (decidePollAction(found, device_info.fConnected)) {
+            var action = decidePollAction(found, device_info.fConnected);
+            // r2-l6 -- H4 audio-dead single-shot: BT says connected but the
+            // render sessions die persistently (A2DP torn down under a live
+            // control link). The ladder NEVER runs on the keepalive branch,
+            // so without this the daemon would loop its reopen cycle forever
+            // while the user hears silence. Routing one poll through the
+            // ladder keeps the sensor alive (the stop branch joins the worker
+            // and resets the streak; the restarted worker rebuilds it) while
+            // the rungs engage with their normal arms and caps. Accepted: R1
+            // may fire while the control link is up — audio is already dead,
+            // and on this dongle the rung is rejected/muted anyway.
+            if (action == .start_keepalive and !state.watchdog_tripped and
+                state.silent.thread != null and
+                state.silent.consec_fails.load(.acquire) >= KEEPALIVE_DEAD_SESSIONS)
+            {
+                debug("audio-dead: render sessions failing on a connected link -- one poll through the ladder", .{});
+                action = .stop_and_connect;
+            }
+            switch (action) {
                 .start_keepalive => {
                     // Earbuds are connected: reset connect backoff and start the
                     // endpoint-targeted keepalive — unless the watchdog paused us.
                     state.connect_fails = 0;
                     state.next_connect_ms = 0;
-                    state.r1_armed_ms = 0; // R1 — link is up, wedge is moot
-                    state.r1_reset_in_episode = false; // R2 — ladder disarmed too
-                    // R3 — the absence episode is over: its per-episode budget,
-                    // spacing history and any queued post-cycle refresh all
-                    // belong to that episode and are dropped with it.
-                    state.r3_restarts_in_episode = 0;
-                    state.r3_last_restart_ms = 0;
-                    state.r3_force_after_ms = 0;
-                    state.r3_last_complete_ms = 0;
+                    // r2-l5 -- flap hysteresis: a lone connected poll is a
+                    // blip, not a cure. Only a stable link closes the
+                    // absence episode; a blip inside an armed episode is
+                    // counted as a flap and the episode stays armed.
+                    state.link_stable_polls +|= 1;
+                    if (state.link_stable_polls >= LINK_STABLE_POLLS_TO_CLOSE) {
+                        state.r1_armed_ms = 0; // R1 — link is up, wedge is moot
+                        state.r1_reset_in_episode = false; // R2 — ladder disarmed too
+                        state.r2_cycled_in_episode = false; // R4 — ladder disarmed too
+                        // R3 — the absence episode is over: its per-episode budget,
+                        // spacing history and any queued post-cycle refresh all
+                        // belong to that episode and are dropped with it.
+                        state.r3_restarts_in_episode = 0;
+                        state.r3_last_restart_ms = 0;
+                        state.r3_force_after_ms = 0;
+                        state.r3_last_complete_ms = 0;
+                        state.flaps_in_episode = 0;
+                        // r2-l9 -- a stable link proves the peer is back.
+                        state.peer_absent_streak = 0;
+                        state.peer_absent_logged = false;
+                        // r2-l9 -- a stable link proves the radio is
+                        // healthy: any repair-backoff history is stale.
+                        state.recovery_fails = 0;
+                        state.recovery_quiet_logged = false;
+                    } else if (state.r1_armed_ms != 0) {
+                        state.flaps_in_episode +|= 1;
+                        debug("flap {}/{}: lone connected poll inside an armed episode -- episode stays armed", .{ state.flaps_in_episode, FLAP_FORCE_R1_AFTER });
+                    }
                     if (!state.watchdog_tripped) state.silent.start(name);
                     return;
                 },
@@ -2125,9 +2508,24 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // Not connected: stop any keepalive (no point streaming to an
                     // absent device -> avoids FxSound/driver churn while away).
                     state.silent.stop();
+                    // r2-l5 -- the stability streak breaks the moment a poll
+                    // observes the link down.
+                    state.link_stable_polls = 0;
                     if (state.watchdog_tripped) return;
 
                     const now = nowMs();
+
+                    // r2-l9 -- elevation comeback: the token check is
+                    // free (no PnP), so it runs every unlinked pass, not
+                    // just on repair passes. Fresh rights reset the
+                    // backoff outright, like a replug does.
+                    if (IsUserAnAdmin() == 0) {
+                        state.recovery_saw_unelevated = true;
+                    } else if (state.recovery_saw_unelevated) {
+                        state.recovery_saw_unelevated = false;
+                        state.recovery_fails = 0;
+                        state.recovery_quiet_logged = false;
+                    }
 
                     // r2-l3 -- RUNG 0: repair before escalate.
                     //
@@ -2138,7 +2536,21 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // in that state is pointless and harmful, so the repair
                     // runs first and blocks the whole ladder until it is
                     // done. It is intentionally NOT capped by a breaker.
-                    if (shouldRetryRecovery(now, state.recovery_last_ms)) {
+                    // r2-l9 -- never touch the driver while a ToothTray
+                    // child is still running: a repair enable landing
+                    // mid-IOCTL is the veto-225 shape from the 2026-09-04
+                    // 23:19 field case. The attempt clock is NOT advanced,
+                    // so the repair simply runs on the next pass.
+                    const tt_busy = toothTrayInFlight(state);
+                    if (tt_busy) {
+                        debug("rung recovery: ToothTray still in flight -- repair deferred one pass (no PnP while a connect IOCTL may be live)", .{});
+                    }
+                    // r2-l9 -- exponential backoff on consecutive FAILED
+                    // passes (recoveryRetryDelayMs): eager at first, quiet
+                    // at the cap. The storm this replaces vetoed the whole
+                    // USB tree every ~6 s until Explorer went down with it.
+                    const rec_delay = recoveryRetryDelayMs(state.recovery_fails);
+                    if (!tt_busy and shouldRetryRecovery(now, state.recovery_last_ms, rec_delay)) {
                         state.recovery_last_ms = now;
                         const journal = recoveryJournalPresent();
                         if (journal and !state.recovery_logged) {
@@ -2150,12 +2562,42 @@ fn performPoll(state: *SharedState, _: u32) !void {
                         // dead without any disable of ours (pnputil 3010
                         // stops it), and that state must never survive.
                         var rout = HealthOut{ .hFile = null, .tag = "rung recovery" };
-                        const repaired = recoverDisabledRadio(&rout, false);
+                        const res = recoverDisabledRadio(&rout, false, state.recovery_quiet_logged);
+                        const repaired = res.repaired;
+                        // r2-l9 -- replug detector: the pass saw the radio
+                        // after having seen it gone. A comeback is fresh
+                        // hardware evidence, so the backoff clock resets
+                        // outright: a replugged dongle is repaired within
+                        // about a minute even under deep backoff.
+                        if (res.present == 0) {
+                            state.recovery_saw_absent = true;
+                        } else if (state.recovery_saw_absent) {
+                            state.recovery_saw_absent = false;
+                            state.recovery_fails = 0;
+                            state.recovery_quiet_logged = false;
+                        }
                         if (journal or repaired) state.recovery_attempts +|= 1;
                         // Judge by observation, never by the return value
                         // (r1-l5): the marker is gone only after the radio
                         // was seen present and started.
                         state.recovery_armed = recoveryJournalPresent();
+                        if (repaired) {
+                            // The radio came back: the backoff clock and the
+                            // quiet flag reset with it.
+                            state.recovery_fails = 0;
+                            state.recovery_quiet_logged = false;
+                        } else if (!state.recovery_armed) {
+                            // Nothing to repair (stale journal cleared, radio
+                            // healthy): the backoff clock resets with it.
+                            state.recovery_fails = 0;
+                            state.recovery_quiet_logged = false;
+                        } else {
+                            state.recovery_fails +|= 1;
+                            if (state.recovery_fails == RECOVERY_QUIET_AFTER and !state.recovery_quiet_logged) {
+                                state.recovery_quiet_logged = true;
+                                debug("rung recovery: {} consecutive failed repairs -- REBOOT REQUIRED likely, going quiet (retry every 1 min). Reboot Windows or run: bluetooth_force.exe --recover", .{state.recovery_fails});
+                            }
+                        }
                         if (!state.recovery_armed and state.recovery_logged) {
                             debug("rung recovery: cleared after {} attempt(s) -- the ladder is armed again", .{state.recovery_attempts});
                             state.recovery_attempts = 0;
@@ -2166,6 +2608,10 @@ fn performPoll(state: *SharedState, _: u32) !void {
                             // attempt before anything harsher is tried.
                             state.connect_fails = 0;
                             state.next_connect_ms = nowMs() + R2_POST_CYCLE_RECONNECT_MS;
+                            // r2-l9 -- the radio changed under us: any
+                            // peer-absent evidence is stale with it.
+                            state.peer_absent_streak = 0;
+                            state.peer_absent_logged = false;
                             return;
                         }
                     }
@@ -2183,6 +2629,17 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // CircuitBreaker below is what keeps resting-earbuds cost
                     // bounded (max 3 resets per 10 minutes, then silence).
                     if (state.r1_armed_ms == 0) state.r1_armed_ms = now;
+                    // r2-l5 -- flap storm: the wall clock never reaches
+                    // R1_ARM_MS because lone connected blips kept the
+                    // episode young. After FLAP_FORCE_R1_AFTER blips the
+                    // arm is backdated so the soft rung fires NOW; R3/R2
+                    // follow in ladder order under their own gates.
+                    if (state.flaps_in_episode >= FLAP_FORCE_R1_AFTER and
+                        state.r1_armed_ms > now - R1_ARM_MS)
+                    {
+                        state.r1_armed_ms = now - R1_ARM_MS;
+                        debug("flap storm ({} blips): forcing the page-scan rung now", .{state.flaps_in_episode});
+                    }
                     // r2-l2 -- a rung that is rejected by this dongle on every
                     // single attempt must not hold the ladder hostage: once it
                     // is proven dead it is muted for the run AND the escalation
@@ -2193,7 +2650,7 @@ fn performPoll(state: *SharedState, _: u32) !void {
                             debug("rung page-scan: MUTED for this run after {} consecutive rejections -- escalation goes straight to the PnP rungs", .{state.r1_rejects});
                         }
                         state.r1_reset_in_episode = true;
-                    } else if (shouldRadioReset(state.r1_armed_ms, now, state.r1_last_reset_ms) and
+                    } else if (!tt_busy and shouldRadioReset(state.r1_armed_ms, now, state.r1_last_reset_ms) and
                         state.r1_breaker.allow(now))
                     {
                         // Rate-limit the whole procedure regardless of outcome.
@@ -2225,7 +2682,7 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // Gate order matches R1/R2: pure gates first, breaker last
                     // (short-circuit, so an early attempt never burns budget),
                     // elevation checked inside restartEarbudDevnodes.
-                    if (!escalationFrozen(state, now) and shouldEarbudRestart(
+                    if (!escalationFrozen(state, now) and !tt_busy and shouldEarbudRestart(
                         state.r1_armed_ms,
                         now,
                         state.r3_last_restart_ms,
@@ -2272,7 +2729,7 @@ fn performPoll(state: *SharedState, _: u32) !void {
                             state.r2_dead_logged = true;
                             debug("rung usb-cycle: MUTED for this run after {} attempt(s) that left the radio not started -- this dongle refuses to be cycled, the earbud-devnode rung stays in charge", .{state.r2_fails});
                         }
-                    } else if (!escalationFrozen(state, now) and shouldUsbCycle(
+                    } else if (!escalationFrozen(state, now) and !tt_busy and !peerAbsentFreeze(state.peer_absent_streak) and shouldUsbCycle(
                         state.r1_armed_ms,
                         now,
                         state.r1_reset_in_episode,
@@ -2306,6 +2763,10 @@ fn performPoll(state: *SharedState, _: u32) !void {
                             state.r3_restarts_in_episode = 0;
                             state.r3_last_restart_ms = 0;
                             state.r2_fails = 0; // it worked: forget the history
+                            // r2-l7 -- a VERIFIED R2 completion unlocks R4: if
+                            // the link is still down past R4_ARM_MS, the wedge
+                            // survived a full PnP restart and lives below it.
+                            state.r2_cycled_in_episode = true;
                             return;
                         }
                         // Cycle failed (no admin / not found / SetupAPI error /
@@ -2314,6 +2775,46 @@ fn performPoll(state: *SharedState, _: u32) !void {
                         // cadence; the gates above plus the breaker keep the
                         // retry rhythm bounded.
                         state.r2_fails +|= 1;
+                    }
+
+                    // R4 — hub port power-cycle, checked right after the
+                    // usb-cycle and BEFORE the L3 backoff gate: a wedge that
+                    // survived a VERIFIED PnP restart must not wait on the
+                    // retry clock. Mirrors the R2 gate order: pure gates
+                    // first, breaker last (short-circuit), admin check inside
+                    // hubPortCycleRadio. r2-l7 mutes the rung after two
+                    // useless port cycles, same as r2-l4 did for R2.
+                    if (hubPortCycleRungDead(state.r4_fails)) {
+                        if (!state.r4_dead_logged) {
+                            state.r4_dead_logged = true;
+                            debug("rung hub-port-cycle: MUTED for this run after {} port cycle(s) that left the link down -- the wedge lives deeper than VBUS", .{state.r4_fails});
+                        }
+                    } else if (!escalationFrozen(state, now) and !tt_busy and !peerAbsentFreeze(state.peer_absent_streak) and shouldHubPortCycle(
+                        state.r1_armed_ms,
+                        now,
+                        state.r2_cycled_in_episode,
+                        state.r4_last_ms,
+                    ) and state.r4_breaker.allow(now))
+                    {
+                        state.r4_last_ms = now;
+                        if (hubPortCycleRadio(state)) {
+                            // The port was power-cycled and the dongle
+                            // re-enumerated: same post-completion policy as
+                            // R2 — fresh clock, settle window, one verified
+                            // R3 refresh (the devnodes are new again).
+                            state.connect_fails = 0;
+                            const after_port = nowMs();
+                            state.next_connect_ms = after_port + R4_POST_CYCLE_RECONNECT_MS;
+                            state.r3_force_after_ms = after_port + R3_POST_CYCLE_DELAY_MS;
+                            state.r3_restarts_in_episode = 0;
+                            state.r3_last_restart_ms = 0;
+                            state.r4_fails = 0; // it worked: forget the history
+                            return;
+                        }
+                        // Port cycle failed or the dongle never came back on
+                        // the port (journal left armed, repair retries). Two
+                        // of these mute the rung for the run.
+                        state.r4_fails +|= 1;
                     }
 
                     if (now < state.next_connect_ms) return; // L3 backoff window
@@ -2325,8 +2826,30 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     triggerConnectionViaToothTray(state, name) catch |e| {
                         switch (e) {
                             error.ToothTrayBusy => {}, // prior attempt still running; no penalty
+                            error.ToothTrayNotFound => {
+                                // r2-l9 -- the peer is gone, not the radio:
+                                // same backoff penalty (don't hammer a
+                                // missing peer), plus the absent streak. At
+                                // PEER_ABSENT_FREEZE_AFTER the R2/R4 rungs
+                                // freeze until the peer returns.
+                                state.peer_absent_streak +|= 1;
+                                state.connect_fails +|= 1;
+                                state.next_connect_ms = now + backoffMs(
+                                    state.connect_fails,
+                                    CONNECT_BACKOFF_BASE_MS,
+                                    CONNECT_BACKOFF_CAP_MS,
+                                );
+                                if (peerAbsentFreeze(state.peer_absent_streak) and !state.peer_absent_logged) {
+                                    state.peer_absent_logged = true;
+                                    debug("peer absent x{} (ToothTray exit 2) -- R2/R4 frozen until the peer returns or the radio proves otherwise; R1/R3 keep running", .{state.peer_absent_streak});
+                                }
+                            },
                             else => {
                                 debug("ToothTrayCli error: {s}", .{@errorName(e)});
+                                // r2-l9 -- presence unknown (timeout, spawn
+                                // failure): any peer-absent evidence is stale.
+                                state.peer_absent_streak = 0;
+                                state.peer_absent_logged = false;
                                 state.connect_fails +|= 1;
                                 state.next_connect_ms = now + backoffMs(
                                     state.connect_fails,
@@ -2348,6 +2871,10 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // by the poll) disarms the recovery window.
                     state.connect_fails = 0;
                     state.next_connect_ms = 0;
+                    // r2-l9 -- exit 0 means the peer answered: any
+                    // peer-absent evidence is stale.
+                    state.peer_absent_streak = 0;
+                    state.peer_absent_logged = false;
                     return;
                 },
                 // found == true rules out .none.
@@ -2434,6 +2961,266 @@ fn radioReset(state: *SharedState, hRadio: ?*anyopaque) bool {
 // call every poll. Success is reported as "complete (N cycled)"; after it the
 // stack needs a few seconds to bring the radio back — the earbuds typically
 // reconnect within ~10 s (field metric), the poll loop simply rides it out.
+// ---------------------------------------------------------------------------
+// R4 — hub port power-cycle core (r2-l7)
+// ---------------------------------------------------------------------------
+
+/// r2-l7 -- locate the CSR dongle's USB instance ID (lowercased ASCII, the
+/// same key the repair rung enables by). Shared by the R4 journal arm and
+/// the post-cycle re-enumeration wait.
+fn findCsrInstanceId(id_out: *[220]u8) ?usize {
+    const devs = SetupDiGetClassDevsW(null, &ENUMERATOR_USB, null, DIGCF_PRESENT | DIGCF_ALLCLASSES) orelse return null;
+    defer _ = SetupDiDestroyDeviceInfoList(devs);
+    var index: u32 = 0;
+    while (true) : (index += 1) {
+        var info = SP_DEVINFO_DATA{
+            .cbSize = @sizeOf(SP_DEVINFO_DATA),
+            .InterfaceClassGuid = GUID_DEVCLASS_USB,
+            .DevInst = 0,
+            .Reserved = 0,
+        };
+        if (SetupDiEnumDeviceInfo(devs, index, &info) == 0) break;
+        var id_wide: [220]u16 = undefined;
+        if (SetupDiGetDeviceInstanceIdW(devs, &info, &id_wide, id_wide.len, null) == 0) continue;
+        var n: usize = 0;
+        while (n < id_wide.len and id_wide[n] != 0) : (n += 1) {}
+        if (n == 0 or n > id_out.len) continue;
+        for (id_wide[0..n], 0..) |ch, i| id_out[i] = asciiLower(@truncate(ch));
+        if (isCsrRadioInstanceId(id_out[0..n])) return n;
+    }
+    return null;
+}
+
+const HubWalkMode = enum { probe, cycle };
+
+const HubWalkResult = struct {
+    hubs: u32 = 0,
+    ports: u32 = 0,
+    cycled: bool = false,
+};
+
+/// r2-l7 -- walk every present USB hub, port by port, through the hub PDO.
+/// probe: read-only, logs one line per CONNECTED device (vid/pid + port).
+/// cycle: sends IOCTL_USB_HUB_CYCLE_PORT to the first port with a
+/// connected CSR dongle, then stops. Every hub handle is closed before the
+/// next hub opens; a failed hub is skipped, never fatal.
+fn walkHubPorts(out: *HealthOut, mode: HubWalkMode) HubWalkResult {
+    var r = HubWalkResult{};
+    // NOTE (r2-l7 fix): SetupDiGetClassDevsW reports failure as
+    // INVALID_HANDLE_VALUE, NOT null — `orelse` alone would accept the
+    // -1 handle as valid and every Enum below would fail silently.
+    const devs_raw = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_HUB, null, null, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE) orelse {
+        out.line("SetupDiGetClassDevsW(USB_HUB) failed 0x{x}", .{GetLastError()});
+        return r;
+    };
+    if (devs_raw == INVALID_HANDLE_VALUE) {
+        out.line("SetupDiGetClassDevsW(USB_HUB) failed 0x{x}", .{GetLastError()});
+        return r;
+    }
+    const devs = devs_raw;
+    defer _ = SetupDiDestroyDeviceInfoList(devs);
+    var index: u32 = 0;
+    while (true) : (index += 1) {
+        var iface = SP_DEVICE_INTERFACE_DATA{
+            .cbSize = @sizeOf(SP_DEVICE_INTERFACE_DATA),
+            .InterfaceClassGuid = GUID_DEVINTERFACE_USB_HUB,
+            .Flags = 0,
+            .Reserved = 0,
+        };
+        if (SetupDiEnumDeviceInterfaces(devs, null, &GUID_DEVINTERFACE_USB_HUB, index, &iface) == 0) {
+            // index 0 failing is either an empty set (259 NO_MORE_ITEMS,
+            // benign) or a real rejection (e.g. 87/1784 = our struct/param
+            // packing is wrong) — log it, never break silently (r2-l7 fix).
+            if (index == 0) out.line("hub enum at index 0 failed 0x{x}", .{GetLastError()});
+            break;
+        }
+        r.hubs += 1;
+        const hub_no = r.hubs;
+        // Block scope: the hub handle below closes before the next hub opens.
+        const stop: bool = blk: {
+            var detail_buf: [2048]u8 align(8) = undefined;
+            var req: u32 = 0;
+            _ = SetupDiGetDeviceInterfaceDetailW(devs, &iface, null, 0, &req, null);
+            if (req <= IFDETAIL_PATH_OFFSET or req > detail_buf.len) {
+                out.line("hub #{}: interface path query failed, skipped", .{hub_no});
+                break :blk false;
+            }
+            std.mem.writeInt(u32, detail_buf[0..4], IFDETAIL_CB_SIZE_X64, .little);
+            if (SetupDiGetDeviceInterfaceDetailW(devs, &iface, @ptrCast(@alignCast(&detail_buf)), req, null, null) == 0) {
+                out.line("hub #{}: interface path read failed 0x{x}, skipped", .{ hub_no, GetLastError() });
+                break :blk false;
+            }
+            const path_n = (req - IFDETAIL_PATH_OFFSET) / 2;
+            if (path_n == 0 or path_n >= 1024) break :blk false;
+            const path_u16: [*]const u16 = @ptrCast(@alignCast(detail_buf[IFDETAIL_PATH_OFFSET..].ptr));
+            var path_z: [1024:0]u16 = undefined;
+            @memcpy(path_z[0..path_n], path_u16[0..path_n]);
+            path_z[path_n] = 0;
+            const hub = CreateFileW(&path_z, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, null, OPEN_EXISTING, 0, null);
+            if (hub == null or hub == INVALID_HANDLE_VALUE) {
+                out.line("hub #{}: open failed 0x{x}, skipped", .{ hub_no, GetLastError() });
+                break :blk false;
+            }
+            defer _ = CloseHandle(hub);
+            // GET_NODE_INFORMATION needs room for the whole hub-variant
+            // struct (hub descriptor tail), not just our prefix: a
+            // sizeof(prefix) output buffer is rejected with 0x7a
+            // (ERROR_INSUFFICIENT_BUFFER, field 2026-09-04). Read the
+            // prefix fields out of the roomy buffer instead.
+            var node_buf: [512]u8 align(8) = undefined;
+            @memset(&node_buf, 0);
+            var ret: u32 = 0;
+            if (DeviceIoControl(hub, IOCTL_USB_GET_NODE_INFORMATION, null, 0, @ptrCast(&node_buf), node_buf.len, &ret, null) == 0) {
+                out.line("hub #{}: GET_NODE_INFORMATION failed 0x{x}, skipped", .{ hub_no, GetLastError() });
+                break :blk false;
+            }
+            const node: *USB_NODE_INFO_PREFIX = @ptrCast(@alignCast(&node_buf));
+            if (node.NodeType != USB_HUB_NODE or node.bNbrPorts == 0 or node.bNbrPorts > 32) {
+                out.line("hub #{}: not a hub node (type={}, ports={}), skipped", .{ hub_no, node.NodeType, node.bNbrPorts });
+                break :blk false;
+            }
+            // Power-switching mode decides whether ANY program can cut VBUS
+            // on this hub's ports (individual) or not (ganged/none). One
+            // line per hub, in both probe and cycle walks — it explains a
+            // future 0x32 CYCLE_PORT refusal before it happens.
+            const hub_chars = std.mem.readInt(u16, node_buf[HUB_CHARS_OFFSET..][0..2], .little);
+            out.line("hub #{}: ports={}, power-switching={s} (wHubCharacteristics=0x{x})", .{ hub_no, node.bNbrPorts, hubPowerMode(hub_chars), hub_chars });
+            var port: u32 = 1;
+            while (port <= node.bNbrPorts) : (port += 1) {
+                r.ports += 1;
+                var conn_buf: [2048]u8 align(8) = undefined;
+                var q: USB_CONN_INFO_PREFIX = undefined;
+                @memset(std.mem.asBytes(&q), 0);
+                q.ConnectionIndex = port;
+                @memcpy(conn_buf[0..@sizeOf(USB_CONN_INFO_PREFIX)], std.mem.asBytes(&q));
+                var got: u32 = 0;
+                var ex_ok: bool = false;
+                var is_ex: bool = false;
+                if (DeviceIoControl(
+                    hub,
+                    IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX,
+                    @ptrCast(&conn_buf),
+                    @sizeOf(USB_CONN_INFO_PREFIX),
+                    @ptrCast(&conn_buf),
+                    conn_buf.len,
+                    &got,
+                    null,
+                ) != 0 and got >= @sizeOf(USB_CONN_INFO_PREFIX)) {
+                    ex_ok = true;
+                    is_ex = true;
+                } else {
+                    // EX unsupported here (xHCI root hub: 0x32 on every
+                    // port) — retry the non-EX variant before giving up
+                    // the port. Same in-buffer (ConnectionIndex first),
+                    // same prefix offsets in the reply.
+                    got = 0;
+                    if (DeviceIoControl(
+                        hub,
+                        IOCTL_USB_GET_NODE_CONNECTION_INFORMATION,
+                        @ptrCast(&conn_buf),
+                        @sizeOf(USB_CONN_INFO_PREFIX),
+                        @ptrCast(&conn_buf),
+                        conn_buf.len,
+                        &got,
+                        null,
+                    ) != 0 and got >= @sizeOf(USB_CONN_INFO_PREFIX)) {
+                        ex_ok = true;
+                        if (mode == .probe) out.line("hub #{} port {}: EX failed, non-EX reply ({} bytes)", .{ hub_no, port, got });
+                    }
+                }
+                if (!ex_ok) {
+                    // Silent `continue` here hid a whole class of field
+                    // failures (r2-l7 fix): in probe mode every port
+                    // reports, so a broken query path is visible, not empty.
+                    if (mode == .probe) out.line("hub #{} port {}: port query failed 0x{x}", .{ hub_no, port, GetLastError() });
+                    continue; // transient port, skip
+                }
+                const info: *USB_CONN_INFO_PREFIX = @ptrCast(@alignCast(&conn_buf));
+                // EX replies carry ConnectionStatus at 32 (prefix struct);
+                // non-EX replies pack tighter — status at 31
+                // (NONEX_CONN_STATUS_OFFSET, proven by hexdump).
+                const status: u32 = if (is_ex) info.ConnectionStatus else std.mem.readInt(u32, conn_buf[NONEX_CONN_STATUS_OFFSET..][0..4], .little);
+                if (mode == .probe) {
+                    out.line("hub #{} port {}: status={} vid_{x:0>4}&pid_{x:0>4}{s}", .{ hub_no, port, status, info.idVendor, info.idProduct, if (info.idVendor == CSR_VID and info.idProduct == CSR_PID) " <-- CSR DONGLE" else "" });
+                }
+                if (status != USB_DEVICE_CONNECTED) continue;
+                const is_csr = info.idVendor == CSR_VID and info.idProduct == CSR_PID;
+                if (mode == .probe) {
+                    continue;
+                }
+                if (!is_csr) continue;
+                out.line("CSR dongle on hub #{} port {}: sending IOCTL_USB_HUB_CYCLE_PORT...", .{ hub_no, port });
+                var params = USB_CYCLE_PORT_PARAMS{ .ConnectionIndex = port, .StatusReturned = 0 };
+                var pret: u32 = 0;
+                if (DeviceIoControl(hub, IOCTL_USB_HUB_CYCLE_PORT, @ptrCast(&params), @sizeOf(USB_CYCLE_PORT_PARAMS), @ptrCast(&params), @sizeOf(USB_CYCLE_PORT_PARAMS), &pret, null) == 0) {
+                    out.line("HUB_CYCLE_PORT failed 0x{x}", .{GetLastError()});
+                    break :blk false;
+                }
+                out.line("port {} cycled (status={})", .{ port, params.StatusReturned });
+                r.cycled = true;
+                break :blk true;
+            }
+            break :blk false;
+        };
+        if (stop) break;
+    }
+    return r;
+}
+
+/// The hub-port-cycle core, shared by the auto-ladder rung (hubPortCycleRadio,
+// dbgview lines under the "rung hub-port-cycle:" tag) and the one-shot
+// --probe-hubs mode (report file + "probe-hubs:" tag, read-only walk).
+fn cycleCsrHubPortOnce(out: *HealthOut) bool {
+    out.line("begin", .{});
+    var id_buf: [220]u8 = undefined;
+    const id_len = findCsrInstanceId(&id_buf) orelse {
+        out.line("CSR radio USB\\VID_0A12&PID_0001 not present, port cycle aborted", .{});
+        return false;
+    };
+    // Journal BEFORE anything that tears the devnode down (r2-l4 lesson):
+    // a cycle whose re-enumeration never arrives must be repaired, and the
+    // repair rung enables by this exact instance ID.
+    if (!recoveryJournalArm(id_buf[0..id_len])) {
+        out.line("cannot write {s} next to the exe -- REFUSING the port cycle (an unrepairable radio is worse than a wedge)", .{RECOVERY_JOURNAL_NAME});
+        return false;
+    }
+    const w = walkHubPorts(out, .cycle);
+    if (!w.cycled) {
+        out.line("dongle present as a devnode but on no scanned hub port (hubs={}, ports={}) -- nothing touched", .{ w.hubs, w.ports });
+        recoveryJournalDisarm();
+        return false;
+    }
+    // The receipt is not the state change (r1-l8): poll for the dongle's
+    // re-enumeration before reporting completion.
+    var waited: u32 = 0;
+    while (true) {
+        var probe: [220]u8 = undefined;
+        if (findCsrInstanceId(&probe) != null) {
+            recoveryJournalDisarm();
+            out.line("complete (hub port cycled, dongle re-enumerated)", .{});
+            return true;
+        }
+        if (waited >= R4_REENUM_VERIFY_MS) break;
+        Sleep(R4_REENUM_POLL_MS);
+        waited += R4_REENUM_POLL_MS;
+    }
+    out.line("port cycled but the dongle did not re-enumerate within {} ms -- journal LEFT ARMED, the repair rung keeps retrying", .{R4_REENUM_VERIFY_MS});
+    return false; // journal deliberately LEFT ARMED
+}
+
+fn hubPortCycleRadio(state: *SharedState) bool {
+    if (IsUserAnAdmin() == 0) {
+        if (!state.r4_admin_skip_logged) {
+            state.r4_admin_skip_logged = true;
+            debug("rung hub-port-cycle: skipped (admin required) — run from diagnose.ps1 or an elevated shell", .{});
+        }
+        return false;
+    }
+    // dbgview-only channel under the historical "rung hub-port-cycle:" tag.
+    var out = HealthOut{ .hFile = null, .tag = "rung hub-port-cycle" };
+    return cycleCsrHubPortOnce(&out);
+}
+
 fn usbCycleRadio(state: *SharedState) bool {
     if (IsUserAnAdmin() == 0) {
         if (!state.r2_admin_skip_logged) {
@@ -2858,6 +3645,45 @@ const HealthOut = struct {
         debug("{s}: {s}", .{ self.tag, body });
     }
 };
+
+// --probe-hubs — read-only R4 validation probe (r2-l7): list every present
+// USB hub with per-port connected VID/PID. Sends no CYCLE_PORT, touches no
+// devnode, writes no journal: safe to run while the daemon is live. The CSR
+// dongle's line carries the "<-- CSR DONGLE" marker — if the marker never
+// appears, R4 can not fire on this machine and the ladder evidence will say
+// so instead of failing silently.
+fn probeHubsMain(args_it: anytype) void {
+    // argv: --probe-hubs [out-path]
+    var out_path_buf: [512]u8 = undefined;
+    var out_path: []const u8 = "btf_probe_hubs.txt";
+    if (args_it.next()) |a| {
+        if (a.len > 0) {
+            const n = @min(a.len, out_path_buf.len);
+            @memcpy(out_path_buf[0..n], a[0..n]);
+            out_path = out_path_buf[0..n];
+        }
+    }
+
+    // Same raw-Win32 report open as --health (GUI-subsystem process).
+    var path_wide: [540]u16 = undefined;
+    var hfile: ?*anyopaque = null;
+    blk: {
+        const wlen = std.unicode.utf8ToUtf16Le(path_wide[0 .. path_wide.len - 1], out_path) catch break :blk;
+        path_wide[wlen] = 0;
+        const h = CreateFileW(@ptrCast(&path_wide), GENERIC_WRITE, 0, null, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+        if (h != INVALID_HANDLE_VALUE) hfile = h;
+    }
+    var out = HealthOut{ .hFile = hfile, .tag = "probe-hubs" };
+    defer {
+        if (hfile) |h| {
+            _ = CloseHandle(h);
+        }
+    }
+
+        out.line("build=r2-l9 admin={} report={s}", .{ IsUserAnAdmin() != 0, out_path });
+    const w = walkHubPorts(&out, .probe);
+    out.line("done: hubs={} ports={}", .{ w.hubs, w.ports });
+}
 
 fn healthMain(args_it: anytype) void {
     const t_start = nowMs();
@@ -3529,7 +4355,14 @@ fn recoveryJournalDisarm() void {
 ///     devnode status only, then pnputil /enable-device as the last resort.
 ///   * nothing was actually disabled -> the journal is stale (we crashed after
 ///     a successful enable) and is cleared.
-fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
+/// quiet (r2-l9) suppresses only the per-pass STILL NOT STARTED line: the
+/// attempts continue at the backoff cap, but the log stops screaming every
+/// pass once the rung has said REBOOT REQUIRED.
+/// r2-l9 -- what a repair pass observed, not just whether it fixed.
+/// present lets the rung notice a replug (0 -> >0 transition) and reset
+/// the backoff clock: fresh hardware evidence beats the failure history.
+const RepairOutcome = struct { repaired: bool, present: u32 };
+fn recoverDisabledRadio(out: *HealthOut, forced: bool, quiet: bool) RepairOutcome {
     // r2-l4: the marker is no longer a precondition, only an ownership
     // flag. A radio that pnputil stopped (exit 3010) is not "disabled",
     // so r2-l3 walked straight past it; the scan below now repairs any
@@ -3539,12 +4372,12 @@ fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
 
     if (IsUserAnAdmin() == 0) {
         out.line("NOT ELEVATED: a disabled radio can only be enabled from an elevated process. Run this in an admin PowerShell: Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_0A12*' | Enable-PnpDevice -Confirm:$false", .{});
-        return false;
+        return .{ .repaired = false, .present = 0 };
     }
 
     const devs = SetupDiGetClassDevsW(null, &ENUMERATOR_USB, null, DIGCF_PRESENT | DIGCF_ALLCLASSES) orelse {
         out.line("SetupDiGetClassDevsW failed 0x{x} -- cannot inspect the radio, journal kept", .{GetLastError()});
-        return false;
+        return .{ .repaired = false, .present = 0 };
     };
     defer _ = SetupDiDestroyDeviceInfoList(devs);
 
@@ -3603,7 +4436,7 @@ fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
         } else {
             out.line("no CSR radio devnode present right now (dongle unplugged?)", .{});
         }
-        return false;
+        return .{ .repaired = false, .present = 0 };
     }
     if (radioRecoveryDone(present, still_disabled)) {
         if (repaired > 0) {
@@ -3612,10 +4445,10 @@ fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
             out.line("nothing to repair: {} radio devnode(s) present and started -- stale journal cleared", .{present});
         }
         recoveryJournalDisarm();
-        return repaired > 0;
+        return .{ .repaired = repaired > 0, .present = present };
     }
-    out.line("STILL NOT STARTED: {} of {} node(s) refused to come back -- journal KEPT, retrying every {} ms. Manual fix in an admin PowerShell: Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_0A12*' | Enable-PnpDevice -Confirm:$false", .{ still_disabled, present, RECOVERY_RETRY_MS });
-    return false;
+    if (!quiet) out.line("STILL NOT STARTED: {} of {} node(s) refused to come back -- journal KEPT, retrying with backoff (cap {} ms). Manual fix in an admin PowerShell: Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_0A12*' | Enable-PnpDevice -Confirm:$false", .{ still_disabled, present, RECOVERY_BACKOFF_CAP_MS });
+    return .{ .repaired = false, .present = present };
 }
 
 fn escalationFrozenByFile() bool {
@@ -3716,7 +4549,7 @@ fn recoverMain(args_it: anytype) void {
         out.line("ABORTED: enabling a devnode requires elevation -- start PowerShell as administrator and run this again", .{});
         ExitProcess(2);
     }
-    const ok = recoverDisabledRadio(&out, true);
+    const ok = recoverDisabledRadio(&out, true, false).repaired;
     if (ok) {
         out.line("result: the radio was disabled and is now enabled -- Bluetooth should be back in Device Manager", .{});
     } else {
@@ -3737,7 +4570,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var args_it = try init.args.iterateAllocator(std.heap.page_allocator);
     defer args_it.deinit();
 
-    const usage = "Usage: bluetooth_force.exe AA:BB:CC:DD:EE:FF [audio-name-substring] | --health [MAC] [report-path] | --cycle [report-path] | --restart-earbuds MAC [report-path] | --recover";
+    const usage = "Usage: bluetooth_force.exe AA:BB:CC:DD:EE:FF [audio-name-substring] | --health [MAC] [report-path] | --cycle [report-path] | --restart-earbuds MAC [report-path] | --recover | --probe-hubs [report-path]";
     _ = args_it.next() orelse exitWithError(usage);
     const arg1 = args_it.next() orelse exitWithError(usage);
     if (std.mem.eql(u8, arg1, "--health")) {
@@ -3756,11 +4589,36 @@ pub fn main(init: std.process.Init.Minimal) !void {
         recoverMain(&args_it);
         return;
     }
+    if (std.mem.eql(u8, arg1, "--probe-hubs")) {
+        probeHubsMain(&args_it);
+        return;
+    }
     const mac_str = arg1;
     const target_mac = parseMacAddr(mac_str) catch |err| switch (err) {
         error.ZeroMacAddress => exitWithError("MAC must be non-zero (00:00:00:00:00:00 is not a valid device)"),
         else => exitWithError("Invalid MAC address format"),
     };
+
+    // r2-l8 -- H19 singleton: two daemons racing the same ToothTray
+    // one-shots fight over the link (ToothTrayBusy, no penalty), so the
+    // second daemon refuses to start. One-shot modes (--health, --cycle,
+    // --restart-earbuds, --recover, --probe-hubs) return above and are
+    // unaffected. The handle is intentionally never closed: it dies with
+    // the process, which is exactly the mutex lifetime we want. Fail-open
+    // on creation errors (e.g. a locked-down session): protection is
+    // best-effort, never a start blocker — only a PROVEN duplicate exits.
+    {
+        var mutex_name: [64:0]u16 = undefined;
+        const mlen = std.unicode.utf8ToUtf16Le(mutex_name[0 .. mutex_name.len - 1], "Global\\BluetoothForceDaemon") catch
+            exitWithError("singleton mutex name encode failed");
+        mutex_name[mlen] = 0;
+        const mtx = CreateMutexW(null, 0, @ptrCast(&mutex_name));
+        if (mtx == null or mtx == INVALID_HANDLE_VALUE) {
+            debug("singleton mutex unavailable (err=0x{x}) -- running WITHOUT instance protection", .{GetLastError()});
+        } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            exitWithError("another bluetooth_force.exe daemon is already running (singleton mutex Global\\BluetoothForceDaemon is held) -- refusing a second instance");
+        }
+    }
 
     // First evidence line — the anchor every DebugView/CLI filter keys on:
     // build tag, target MAC, exe path, elevation state (R2 needs admin=1).
@@ -3777,19 +4635,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // r2-l1: open the durable log BEFORE the start line, so the very first
         // evidence line also lands in btf.log.
         logFileInit();
-        debug("start: build=r2-l4 mac={s} exe={s} admin={} log={s}", .{
+            debug("start: build=r2-l9 mac={s} exe={s} admin={} log={s}", .{
             mac_str,
             exe_str,
             IsUserAnAdmin() != 0,
             if (log_handle != null) "btf.log" else "NONE (file log unavailable)",
         });
-        debug("policy: automatic rungs are radio repair -> ToothTray connect -> page-scan toggle -> earbud-devnode restart -> usb-cycle. The radio is never left un-started: any present radio devnode that is not STARTED (stopped, reboot-pending, failed start, or a disable of ours) is repaired on every poll, a deliberate user disable is respected, and the usb-cycle rung mutes itself after two attempts that leave the radio not started. NO Bluetooth service is ever stopped automatically (crash bucket 0x139_3_CORRUPT_LIST_ENTRY_BthA2dp!IrpList_HandleCancel). Manual stack restart: poc\\restart_bt_stack.ps1", .{});
+        debug("policy: automatic rungs are radio repair -> ToothTray connect -> page-scan toggle -> earbud-devnode restart -> usb-cycle -> hub port power-cycle. The radio is never left un-started: any present radio devnode that is not STARTED (stopped, reboot-pending, failed start, or a disable of ours) is repaired on every poll, a deliberate user disable is respected, and the usb-cycle and hub-port-cycle rungs mute themselves after two attempts that leave the radio not started / the link down. NO Bluetooth service is ever stopped automatically (crash bucket 0x139_3_CORRUPT_LIST_ENTRY_BthA2dp!IrpList_HandleCancel). Manual stack restart: poc\\restart_bt_stack.ps1", .{});
         // r2-l3 -- a persistent disable outlives the process that made it,
         // so the very first thing a new run does is account for one.
         if (recoveryJournalPresent()) {
             debug("startup: a pending disable journal was found -- repairing the radio BEFORE the ladder starts", .{});
             var rout = HealthOut{ .hFile = null, .tag = "startup recovery" };
-            _ = recoverDisabledRadio(&rout, false);
+            _ = recoverDisabledRadio(&rout, false, false);
         }
         if (escalationFrozenByFile()) {
             debug("escalation FROZEN at startup by btf_freeze.txt — earbud-restart and usb-cycle are disabled; delete that file to re-enable", .{});
@@ -5109,7 +5967,69 @@ test "shouldUsbCycle: sentinel last_cycle_ms allows the very first cycle" {
     try expect(shouldUsbCycle(armed, armed + R2_ARM_MS, true, 0));
 }
 
-test "R2 breaker: hard-caps the storm at 2 cycles per 10-minute window" {
+    test "R4 gate: fires only after a verified R2 inside the episode, past the arm window" {
+        const armed: i64 = 1_000_000;
+        // Not armed, or R2 never completed this episode: dormant.
+        try expect(!shouldHubPortCycle(0, armed + R4_ARM_MS + 60_000, true, 0));
+        try expect(!shouldHubPortCycle(armed, armed + R4_ARM_MS + 60_000, false, 0));
+        // R2 completed but the arm window has not elapsed: early.
+        try expect(!shouldHubPortCycle(armed, armed + R4_ARM_MS - 1, true, 0));
+        // Armed + R2 done + window elapsed: fire.
+        try expect(shouldHubPortCycle(armed, armed + R4_ARM_MS, true, 0));
+    }
+
+    test "R4 gate: min interval keeps two port cycles apart" {
+        const armed: i64 = 1_000_000;
+        const last: i64 = armed + R4_ARM_MS + 10_000;
+        try expect(!shouldHubPortCycle(armed, last + R4_MIN_INTERVAL_MS - 1, true, last));
+        try expect(shouldHubPortCycle(armed, last + R4_MIN_INTERVAL_MS, true, last));
+    }
+
+    test "R4 gate: sentinel last_portcycle_ms allows the very first port cycle" {
+        const armed: i64 = 1_000_000;
+        try expect(shouldHubPortCycle(armed, armed + R4_ARM_MS, true, 0));
+    }
+
+    test "R4 mute: two useless port cycles hush the rung for the run" {
+        try expect(!hubPortCycleRungDead(0));
+        try expect(!hubPortCycleRungDead(1));
+        try expect(hubPortCycleRungDead(R4_DEAD_FAILURES));
+    }
+
+    test "R4 breaker: hard-caps the storm at 2 port cycles per 10-minute window" {
+        var breaker = CircuitBreaker{
+            .window_ms = R4_CB_WINDOW_MS,
+            .max_events = R4_CB_MAX_PORTCYCLES,
+            .cooldown_ms = R4_CB_COOLDOWN_MS,
+        };
+        const t0: i64 = 5_000_000;
+        try expect(breaker.allow(t0));
+        try expect(breaker.allow(t0 + 300_000));
+        try expect(!breaker.allow(t0 + 300_001));
+    }
+
+    test "R4 ABI: USB hub IOCTL codes and struct layouts match usbioctl.h" {
+        // CTL_CODE(FILE_DEVICE_USB=0x22, fn, METHOD_BUFFERED, FILE_ANY_ACCESS).
+        try expect(IOCTL_USB_GET_NODE_INFORMATION == 0x220408);
+        try expect(IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX == 0x220484);
+        try expect(IOCTL_USB_HUB_CYCLE_PORT == 0x220488);
+        // C layout: 4+18+1+1+1+(pad)+2+4+4 = 36 bytes; bNbrPorts at offset 6.
+        try expect(@sizeOf(USB_CONN_INFO_PREFIX) == 36);
+        try expect(@offsetOf(USB_CONN_INFO_PREFIX, "idVendor") == 12);
+        try expect(@offsetOf(USB_CONN_INFO_PREFIX, "ConnectionStatus") == 32);
+        try expect(@offsetOf(USB_NODE_INFO_PREFIX, "bNbrPorts") == 6);
+        try expect(@sizeOf(USB_CYCLE_PORT_PARAMS) == 8);
+        // wHubCharacteristics u16LE at raw offset 7 of the node reply
+        // (hub descriptor starts at 4: len@4 type@5 ports@6 chars@7).
+        var fake: [9]u8 = .{ 0, 0, 0, 0, 9, 0x29, 2, 0x09, 0x00 };
+        try expect(std.mem.readInt(u16, fake[HUB_CHARS_OFFSET..][0..2], .little) == 0x0009);
+        try expect(std.mem.eql(u8, hubPowerMode(0x0000), "ganged"));
+        try expect(std.mem.eql(u8, hubPowerMode(0x0001), "individual"));
+        try expect(std.mem.eql(u8, hubPowerMode(0x0002), "none"));
+        try expect(std.mem.eql(u8, hubPowerMode(0x0003), "none"));
+    }
+
+    test "R2 breaker: hard-caps the storm at 2 cycles per 10-minute window" {
     // Same L5 primitive, stricter budget: two cycles are allowed inside one
     // window, the third call trips it and silences the rung for the cooldown.
     var breaker = CircuitBreaker{
@@ -5294,6 +6214,18 @@ test "SilentKeepalive: init resolves to WAVE_MAPPER default endpoint" {
     try expect(ka.override_name == null);
 }
 
+test "r2-l6 audio-dead: init seeds a zero fail streak, stop() resets it" {
+    var ka = SilentKeepalive.init();
+    defer ka.stop();
+    try expectEqual(@as(u32, 0), ka.consec_fails.load(.acquire));
+    // A dead worker's streak must not leak into the next incarnation:
+    // stop() (which joins it) is the sensor reset for the single-shot.
+    ka.consec_fails.store(7, .release);
+    ka.stop();
+    try expectEqual(@as(u32, 0), ka.consec_fails.load(.acquire));
+    try expectEqual(@as(u32, 3), KEEPALIVE_DEAD_SESSIONS);
+}
+
 // ===========================================================================
 // r2-l1 tests — the earbud-devnode restart rung, the kill switch, and the
 // safety invariant that replaced the service-restart wave.
@@ -5423,8 +6355,9 @@ test "r2-l1 gate table: every decision matches the simulated ladder" {
         } else if (std.mem.eql(u8, kind, "rcv")) {
             const now = try std.fmt.parseInt(i64, it.next() orelse return error.BadGateTable, 10);
             const last = try std.fmt.parseInt(i64, it.next() orelse return error.BadGateTable, 10);
+            const delay = try std.fmt.parseInt(i64, it.next() orelse return error.BadGateTable, 10);
             const want = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
-            try expectEqual(want, shouldRetryRecovery(now, last));
+            try expectEqual(want, shouldRetryRecovery(now, last, delay));
         } else if (std.mem.eql(u8, kind, "rdone")) {
             const present = try std.fmt.parseInt(u32, it.next() orelse return error.BadGateTable, 10);
             const left = try std.fmt.parseInt(u32, it.next() orelse return error.BadGateTable, 10);
@@ -5517,22 +6450,50 @@ test "r2-l1 log: rotation threshold keeps btf.log bounded" {
 
 test "r2-l3 recovery: a repair is retried on a fixed interval and never stalls" {
     // First ever attempt.
-    try expect(shouldRetryRecovery(0, 0));
-    try expect(shouldRetryRecovery(500_000, 0));
+    try expect(shouldRetryRecovery(0, 0, RECOVERY_RETRY_MS));
+    try expect(shouldRetryRecovery(500_000, 0, RECOVERY_RETRY_MS));
     // Inside the interval: wait. On or past it: go.
     const t: i64 = 500_000;
-    try expect(!shouldRetryRecovery(t, t));
-    try expect(!shouldRetryRecovery(t + RECOVERY_RETRY_MS - 1, t));
-    try expect(shouldRetryRecovery(t + RECOVERY_RETRY_MS, t));
-    try expect(shouldRetryRecovery(t + 10 * RECOVERY_RETRY_MS, t));
+    try expect(!shouldRetryRecovery(t, t, RECOVERY_RETRY_MS));
+    try expect(!shouldRetryRecovery(t + RECOVERY_RETRY_MS - 1, t, RECOVERY_RETRY_MS));
+    try expect(shouldRetryRecovery(t + RECOVERY_RETRY_MS, t, RECOVERY_RETRY_MS));
+    try expect(shouldRetryRecovery(t + 10 * RECOVERY_RETRY_MS, t, RECOVERY_RETRY_MS));
     // A backwards clock (NTP step, DST, sleep/resume) must never be able to
     // park a disabled radio for hours: a negative delta means "go now".
-    try expect(shouldRetryRecovery(t - 1, t));
-    try expect(shouldRetryRecovery(0, t));
+    try expect(shouldRetryRecovery(t - 1, t, RECOVERY_RETRY_MS));
+    try expect(shouldRetryRecovery(0, t, RECOVERY_RETRY_MS));
     // Repairs are far more eager than any escalation rung.
     try expect(RECOVERY_RETRY_MS < R1_ARM_MS);
     try expect(RECOVERY_RETRY_MS < R3_ARM_MS);
     try expect(RECOVERY_RETRY_MS < R2_ARM_MS);
+}
+
+test "r2-l9 recovery: consecutive failures back off exponentially toward the cap" {
+    // Fresh failure: eager. Then doubling, then pinned at the cap.
+    try expect(recoveryRetryDelayMs(0) == 5_000);
+    try expect(recoveryRetryDelayMs(1) == 10_000);
+    try expect(recoveryRetryDelayMs(2) == 20_000);
+    try expect(recoveryRetryDelayMs(3) == 40_000);
+    try expect(recoveryRetryDelayMs(4) == RECOVERY_BACKOFF_CAP_MS);
+    try expect(recoveryRetryDelayMs(9) == RECOVERY_BACKOFF_CAP_MS);
+    try expect(recoveryRetryDelayMs(100) == RECOVERY_BACKOFF_CAP_MS);
+    // The gate honors the delay: inside it wait, past it go.
+    const t: i64 = 1_000_000;
+    try expect(!shouldRetryRecovery(t + 39_999, t, recoveryRetryDelayMs(3)));
+    try expect(shouldRetryRecovery(t + 40_000, t, recoveryRetryDelayMs(3)));
+    // Even at the cap the rung never stops: it only slows down.
+    try expect(shouldRetryRecovery(t + RECOVERY_BACKOFF_CAP_MS, t, recoveryRetryDelayMs(100)));
+    // The quiet threshold is reachable but finite: 10 fails, then the rung
+    // says REBOOT REQUIRED once and retries at the cap.
+    try expect(RECOVERY_QUIET_AFTER == 10);
+}
+
+test "r2-l9 peer-absent: a streak of exit-2 freezes only the radio-destructive rungs" {
+    try expect(!peerAbsentFreeze(0));
+    try expect(!peerAbsentFreeze(PEER_ABSENT_FREEZE_AFTER - 1));
+    try expect(peerAbsentFreeze(PEER_ABSENT_FREEZE_AFTER));
+    try expect(peerAbsentFreeze(PEER_ABSENT_FREEZE_AFTER + 100));
+    try expect(TOOTHTRAY_EXIT_NOT_FOUND == 2);
 }
 
 test "r2-l3 recovery: an unplugged dongle is not a completed repair" {
@@ -5586,7 +6547,9 @@ test "r2-l3 INVARIANT: the journal is armed BEFORE the disable and released afte
 
     // The repair path must never be capped by a circuit breaker: giving up on
     // re-enabling the user's Bluetooth is not an acceptable outcome.
-    const rung0_at = std.mem.indexOf(u8, source, "if (shouldRetryRecovery(now, state.recovery_last_ms)) {") orelse return error.Rung0Missing;
+    // (r2-l9: the call now carries the backoff delay — exponential slowdown,
+    // never a cap — and a ToothTray in-flight deferral; neither is a breaker.)
+    const rung0_at = std.mem.indexOf(u8, source, "shouldRetryRecovery(now, state.recovery_last_ms, rec_delay)") orelse return error.Rung0Missing;
     const rung0_end = std.mem.indexOfPos(u8, source, rung0_at, "if (recoveryBlocksEscalation(") orelse return error.Rung0Missing;
     try expect(std.mem.indexOf(u8, source[rung0_at..rung0_end], "breaker") == null);
 
