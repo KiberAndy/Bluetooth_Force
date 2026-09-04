@@ -1000,6 +1000,16 @@ const R2_ENABLE_VERIFY_MS: u32 = 2_500; // observe DN_STARTED per enable path
 const RECOVERY_JOURNAL_NAME = "btf_pending_enable.txt";
 pub const RECOVERY_RETRY_MS: i64 = 5_000; // repairs are NOT rate-limited like escalations
 const RECOVERY_VERIFY_MS: u32 = 3_000;
+// r2-l4 -- pnputil exit codes we must not read as success.
+// 3010 = ERROR_SUCCESS_REBOOT_REQUIRED: the node was STOPPED and can not
+// be restarted until a reboot. Field 2026-09-03 20:10:54 -- this is how a
+// radio ends up dead without a single disable call of ours.
+const PNPUTIL_REBOOT_REQUIRED: u32 = 3010;
+// After this many usb-cycle attempts that left the radio not started, the
+// rung is muted for the run: on this dongle it is pure damage. Every
+// observed attempt either did nothing (exit 0 in 16 ms, no cure) or
+// stopped the radio (3010) and then failed to disable/enable it back.
+const R2_DEAD_FAILURES: u32 = 2;
 // pnputil owns the PnP stack even when our in-process calls are refused,
 // and /restart-device never writes the persistent disabled flag at all.
 const PNPUTIL_TIMEOUT_MS: u32 = 30_000;
@@ -1425,6 +1435,11 @@ const SharedState = struct {
     recovery_last_ms: i64 = 0,
     recovery_attempts: u32 = 0,
     recovery_logged: bool = false,
+    // r2-l4 -- the usb-cycle rung mutes itself after R2_DEAD_FAILURES
+    // attempts that left the radio not started (field 2026-09-03: every
+    // single attempt on this dongle was either a no-op or damage).
+    r2_fails: u32 = 0,
+    r2_dead_logged: bool = false,
     r3_breaker: CircuitBreaker = .{
         .window_ms = R3_CB_WINDOW_MS,
         .max_events = R3_CB_MAX_RESTARTS,
@@ -1770,6 +1785,35 @@ pub fn recoveryBlocksEscalation(recovery_armed: bool) bool {
     return recovery_armed;
 }
 
+/// r2-l4 -- does this radio devnode need repairing?
+///
+/// r2-l3 only ever looked for the software-disabled state, so a radio that
+/// pnputil had STOPPED (exit 3010, reboot pending) or that failed to start
+/// was left dead: not disabled, therefore not repaired. That is precisely
+/// the state the user found after replugging the dongle.
+///
+/// The one state we must NOT touch on our own initiative is a deliberate
+/// user disable (CM_PROB_DISABLED) that we do not own -- if the journal is
+/// not armed, somebody turned Bluetooth off on purpose and fighting them
+/// would be a worse bug than the one we are fixing. `--recover` is the
+/// explicit, user-driven exception and passes journal_armed = true.
+pub fn radioNeedsRepair(status: u32, problem: u32, journal_armed: bool) bool {
+    if (devnodeStatusMeansStarted(status, problem)) return false;
+    if (devnodeStatusMeansDisabled(status, problem)) return journal_armed;
+    // Anything else -- stopped, reboot pending, start failure, unknown
+    // problem code -- is a fault, and a fault is always ours to repair.
+    return true;
+}
+
+/// r2-l4 -- the usb-cycle rung is muted once it has proven harmful.
+/// Same idea as radioResetRungDead for the page-scan rung: hardware that
+/// answers every cycle attempt with 3010 / SPAPI_E_NO_SUCH_DEVINST /
+/// "disable failed" will never be cured by trying harder, and each try
+/// risks leaving the radio stopped. The softer rungs keep working.
+pub fn usbCycleRungDead(consecutive_failures: u32) bool {
+    return consecutive_failures >= R2_DEAD_FAILURES;
+}
+
 fn getSelfDir(buf: []u8) ![]u8 {
     var self_path_w: [2048:0]u16 = undefined;
     const len = GetModuleFileNameW(null, &self_path_w, @as(u32, self_path_w.len));
@@ -2096,25 +2140,33 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // done. It is intentionally NOT capped by a breaker.
                     if (shouldRetryRecovery(now, state.recovery_last_ms)) {
                         state.recovery_last_ms = now;
+                        const journal = recoveryJournalPresent();
+                        if (journal and !state.recovery_logged) {
+                            state.recovery_logged = true;
+                            debug("rung recovery: a pending disable was left behind ({s}) -- every escalation rung is BLOCKED until the radio is healthy again", .{RECOVERY_JOURNAL_NAME});
+                        }
+                        // r2-l4: the pass runs on EVERY unlinked poll, not
+                        // only when the marker exists. The radio can be
+                        // dead without any disable of ours (pnputil 3010
+                        // stops it), and that state must never survive.
+                        var rout = HealthOut{ .hFile = null, .tag = "rung recovery" };
+                        const repaired = recoverDisabledRadio(&rout, false);
+                        if (journal or repaired) state.recovery_attempts +|= 1;
+                        // Judge by observation, never by the return value
+                        // (r1-l5): the marker is gone only after the radio
+                        // was seen present and started.
                         state.recovery_armed = recoveryJournalPresent();
-                        if (state.recovery_armed) {
-                            state.recovery_attempts +|= 1;
-                            if (!state.recovery_logged) {
-                                state.recovery_logged = true;
-                                debug("rung recovery: a pending disable was left behind ({s}) -- every escalation rung is BLOCKED until the radio is enabled again", .{RECOVERY_JOURNAL_NAME});
-                            }
-                            var rout = HealthOut{ .hFile = null, .tag = "rung recovery" };
-                            _ = recoverDisabledRadio(&rout, false);
-                            // Re-read the marker instead of trusting the
-                            // return value (r1-l5: an API receipt is not a
-                            // state). Only the marker being gone means the
-                            // radio was observed present and started.
-                            state.recovery_armed = recoveryJournalPresent();
-                            if (!state.recovery_armed) {
-                                debug("rung recovery: cleared after {} attempt(s) -- the ladder is armed again", .{state.recovery_attempts});
-                                state.recovery_attempts = 0;
-                                state.recovery_logged = false;
-                            }
+                        if (!state.recovery_armed and state.recovery_logged) {
+                            debug("rung recovery: cleared after {} attempt(s) -- the ladder is armed again", .{state.recovery_attempts});
+                            state.recovery_attempts = 0;
+                            state.recovery_logged = false;
+                        }
+                        if (repaired) {
+                            // A repaired radio deserves a reconnect
+                            // attempt before anything harsher is tried.
+                            state.connect_fails = 0;
+                            state.next_connect_ms = nowMs() + R2_POST_CYCLE_RECONNECT_MS;
+                            return;
                         }
                     }
                     if (recoveryBlocksEscalation(state.recovery_armed)) return;
@@ -2208,7 +2260,19 @@ fn performPoll(state: *SharedState, _: u32) !void {
                     // the R1 gate order: pure gates first, breaker last
                     // (short-circuit, so an armed-but-early cycle never burns
                     // breaker budget), admin check inside usbCycleRadio.
-                    if (!escalationFrozen(state, now) and shouldUsbCycle(
+                    // r2-l4 -- the muted-rung rule that r2-l2 gave the
+                    // page-scan rung now covers the usb-cycle too. On this
+                    // dongle the field log shows it can only do harm: the
+                    // restart either changes nothing or returns 3010 and
+                    // leaves the radio stopped, and both disable paths are
+                    // refused. The earbud-devnode rung, which does work,
+                    // keeps running.
+                    if (usbCycleRungDead(state.r2_fails)) {
+                        if (!state.r2_dead_logged) {
+                            state.r2_dead_logged = true;
+                            debug("rung usb-cycle: MUTED for this run after {} attempt(s) that left the radio not started -- this dongle refuses to be cycled, the earbud-devnode rung stays in charge", .{state.r2_fails});
+                        }
+                    } else if (!escalationFrozen(state, now) and shouldUsbCycle(
                         state.r1_armed_ms,
                         now,
                         state.r1_reset_in_episode,
@@ -2241,11 +2305,15 @@ fn performPoll(state: *SharedState, _: u32) !void {
                             state.r3_force_after_ms = after_cycle + R3_POST_CYCLE_DELAY_MS;
                             state.r3_restarts_in_episode = 0;
                             state.r3_last_restart_ms = 0;
+                            state.r2_fails = 0; // it worked: forget the history
                             return;
                         }
-                        // Cycle failed (no admin / not found / SetupAPI error):
-                        // fall through to the normal cadence; the gates above
-                        // plus the breaker keep the retry rhythm bounded.
+                        // Cycle failed (no admin / not found / SetupAPI error /
+                        // pnputil 3010). r2-l4 counts it: two of these and the
+                        // rung is muted for the run. Fall through to the normal
+                        // cadence; the gates above plus the breaker keep the
+                        // retry rhythm bounded.
+                        state.r2_fails +|= 1;
                     }
 
                     if (now < state.next_connect_ms) return; // L3 backoff window
@@ -2443,6 +2511,9 @@ fn cycleCsrRadioOnce(out: *HealthOut) bool {
         // scanned>0 without a match => the MATCH is broken (ID shape). r1-l5
         // shipped a broken query and the log could not tell the two apart.
         out.line("CSR radio USB\\VID_0A12&PID_0001 not present (scanned {d} devnodes on the USB enumerator), cycle aborted", .{scanned});
+        // r2-l4: nothing was touched in this call, but a marker from an
+        // earlier attempt must survive -- the dongle being absent is
+        // exactly when the repair still has work to do (see rung 0).
         return false;
     }
 
@@ -2450,10 +2521,26 @@ fn cycleCsrRadioOnce(out: *HealthOut) bool {
     // line is the anchor that ties the fix to the user's physical dongle.
     out.line("cycling {s}...", .{id_ascii[0..matched_len]});
 
-    // r2-l3 -- try the NON-PERSISTENT path first. pnputil /restart-device
-    // stops and restarts the devnode without ever writing the persistent
-    // disabled flag, so a process death in the middle of it can not leave
-    // the user without Bluetooth. Same power-cycle effect on the radio.
+    // r2-l4 -- ARM THE JOURNAL BEFORE *ANYTHING* THAT CAN STOP THE RADIO.
+    //
+    // r2-l3 armed it only around the persistent disable and treated
+    // `pnputil /restart-device` as harmless. The field log of 2026-09-03
+    // disproved that: at 20:10:54 the restart returned 3010
+    // (ERROR_SUCCESS_REBOOT_REQUIRED) -- the radio was STOPPED and could
+    // not be brought back -- and at 22:33:37 the follow-up disable failed
+    // with SPAPI_E_NO_SUCH_DEVINST because the devnode was already gone.
+    // Both times the marker was released on the way out, so nothing
+    // repaired the radio, and after the replug Bluetooth showed up off.
+    //
+    // From here on the whole attempt is journalled, and if the marker can
+    // not be made durable the cycle is not attempted at all.
+    if (!recoveryJournalArm(id_ascii[0..matched_len])) {
+        out.line("cannot write {s} next to the exe -- REFUSING to touch the dongle (an unrepairable radio is worse than a wedge)", .{RECOVERY_JOURNAL_NAME});
+        return false;
+    }
+
+    // Non-persistent path first: it never writes the persistent disabled
+    // flag, so if it works the radio can not be stranded by a crash.
     {
         var exe_buf: [1100]u8 = undefined;
         if (systemPathOf(&exe_buf, "pnputil.exe")) |pnputil| {
@@ -2461,22 +2548,21 @@ fn cycleCsrRadioOnce(out: *HealthOut) bool {
             if (std.fmt.bufPrint(&cmd_buf, "\"{s}\" /restart-device \"{s}\"", .{ pnputil, id_ascii[0..matched_len] })) |cmd| {
                 const code = runHiddenWait(cmd, PNPUTIL_TIMEOUT_MS);
                 if (code != null and code.? == 0 and waitDevnodeStarted(target.DevInst, R2_ENABLE_VERIFY_MS)) {
+                    recoveryJournalDisarm();
                     out.line("complete (1 cycled via pnputil /restart-device, no persistent disable needed)", .{});
                     return true;
+                }
+                if (code != null and code.? == PNPUTIL_REBOOT_REQUIRED) {
+                    // The radio is stopped and Windows wants a reboot to
+                    // bring it back. Do NOT pile a disable on top of that:
+                    // hand it straight to the repair rung, which will keep
+                    // trying to start it and stays armed until it does.
+                    out.line("pnputil /restart-device returned 3010 (REBOOT REQUIRED) -- the radio is STOPPED. Not disabling anything; the repair rung takes over and keeps retrying. If it never comes back, reboot Windows or run: bluetooth_force.exe --recover", .{});
+                    return false; // journal deliberately LEFT ARMED
                 }
                 out.line("pnputil /restart-device did not verify (exit={?}) -- falling back to the journalled disable/enable pair", .{code});
             } else |_| {}
         }
-    }
-
-    // r2-l3 -- ARM THE JOURNAL BEFORE THE DISABLE. A persistent disable
-    // outlives this process, a replug and a reboot; on 2026-09-03 the user
-    // was left with Bluetooth switched off in Device Manager exactly that
-    // way. If the marker can not be made durable, the disable is not
-    // attempted at all.
-    if (!recoveryJournalArm(id_ascii[0..matched_len])) {
-        out.line("cannot write {s} next to the exe -- REFUSING to disable the dongle (an unrecoverable disable is worse than a wedge)", .{RECOVERY_JOURNAL_NAME});
-        return false;
     }
 
     // Disable: primary path is DIF_PROPERTYCHANGE (what Device Manager does);
@@ -2489,8 +2575,18 @@ fn cycleCsrRadioOnce(out: *HealthOut) bool {
         if (CM_Disable_DevNode(target.DevInst, 0) == CR_SUCCESS) {
             out.line("DIF disable failed 0x{x}, disabled via CM_Disable_DevNode", .{dif_err});
         } else {
-            out.line("disable failed (DIF 0x{x}, CM failed too), dongle left as-is", .{dif_err});
-            recoveryJournalDisarm(); // nothing was disabled: nothing to repair
+            out.line("disable failed (DIF 0x{x}, CM failed too)", .{dif_err});
+            // r2-l4: "the disable failed" does NOT mean "the radio is
+            // fine". At 22:33:37 the disable failed with
+            // SPAPI_E_NO_SUCH_DEVINST *because* the earlier restart had
+            // already taken the devnode down. Only a verified started
+            // state may release the marker.
+            if (devnodeStarted(target.DevInst)) {
+                recoveryJournalDisarm();
+                out.line("radio verified STARTED, dongle left as-is", .{});
+            } else {
+                out.line("radio is NOT started -- keeping {s} armed so the repair rung brings it back", .{RECOVERY_JOURNAL_NAME});
+            }
             return false;
         }
     }
@@ -2505,8 +2601,13 @@ fn cycleCsrRadioOnce(out: *HealthOut) bool {
         out.line("disable not observed in {} ms — trying CM_Disable_DevNode", .{R2_DISABLE_VERIFY_MS});
         const cm_dis = CM_Disable_DevNode(target.DevInst, 0) == CR_SUCCESS;
         if (!cm_dis or !waitDevnodeDisabled(target.DevInst, R2_DISABLE_VERIFY_MS)) {
-            out.line("disable did not take effect — aborting WITHOUT enabling, dongle state untouched", .{});
-            recoveryJournalDisarm(); // the node never went down: nothing to repair
+            out.line("disable did not take effect — aborting WITHOUT enabling", .{});
+            if (devnodeStarted(target.DevInst)) {
+                recoveryJournalDisarm();
+                out.line("radio verified STARTED, dongle state untouched", .{});
+            } else {
+                out.line("radio is NOT started -- keeping {s} armed so the repair rung brings it back", .{RECOVERY_JOURNAL_NAME});
+            }
             return false;
         }
     }
@@ -2574,6 +2675,26 @@ fn devnodeDisabled(devinst: u32) bool {
     var problem: u32 = 0;
     if (CM_Get_DevNode_Status(&status, &problem, devinst, 0) != 0) return false;
     return devnodeStatusMeansDisabled(status, problem);
+}
+
+/// r2-l4 -- true when the node is present but not in a healthy started
+/// state. A failed status query is treated as "no repair": the node is
+/// most likely gone, and guessing would make us enable the wrong device.
+fn devnodeNeedsRepair(devinst: u32, journal_armed: bool) bool {
+    var status: u32 = 0;
+    var problem: u32 = 0;
+    if (CM_Get_DevNode_Status(&status, &problem, devinst, 0) != 0) return false;
+    return radioNeedsRepair(status, problem, journal_armed);
+}
+
+/// r2-l4 -- the post-condition of every cycle attempt: is the radio
+/// actually running right now? An abort that leaves it stopped must keep
+/// the repair journal armed instead of releasing it.
+fn devnodeStarted(devinst: u32) bool {
+    var status: u32 = 0;
+    var problem: u32 = 0;
+    if (CM_Get_DevNode_Status(&status, &problem, devinst, 0) != 0) return false;
+    return devnodeStatusMeansStarted(status, problem);
 }
 
 /// Poll until the devnode shows the started state (or the timeout expires).
@@ -3409,7 +3530,12 @@ fn recoveryJournalDisarm() void {
 ///   * nothing was actually disabled -> the journal is stale (we crashed after
 ///     a successful enable) and is cleared.
 fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
-    if (!forced and !recoveryJournalPresent()) return false;
+    // r2-l4: the marker is no longer a precondition, only an ownership
+    // flag. A radio that pnputil stopped (exit 3010) is not "disabled",
+    // so r2-l3 walked straight past it; the scan below now repairs any
+    // unhealthy state and touches a deliberate user disable only when the
+    // marker says the disable is ours (or --recover was asked for).
+    const owns_disable = forced or recoveryJournalPresent();
 
     if (IsUserAnAdmin() == 0) {
         out.line("NOT ELEVATED: a disabled radio can only be enabled from an elevated process. Run this in an admin PowerShell: Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_0A12*' | Enable-PnpDevice -Confirm:$false", .{});
@@ -3446,26 +3572,37 @@ fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
         if (!isCsrRadioInstanceId(id)) continue;
 
         present += 1;
-        if (!devnodeDisabled(info.DevInst)) continue;
+        if (!devnodeNeedsRepair(info.DevInst, owns_disable)) continue;
 
-        out.line("DISABLED radio devnode: {s} -- enabling", .{id});
+        out.line("UNHEALTHY radio devnode: {s} -- bringing it back", .{id});
         var ok = enableDevnodeVerified(devs, &info, id, out);
         if (!ok) {
             var exe_buf: [1100]u8 = undefined;
             if (systemPathOf(&exe_buf, "pnputil.exe")) |pnputil| {
-                var cmd_buf: [1500]u8 = undefined;
-                if (std.fmt.bufPrint(&cmd_buf, "\"{s}\" /enable-device \"{s}\"", .{ pnputil, id })) |cmd| {
-                    const code = runHiddenWait(cmd, PNPUTIL_TIMEOUT_MS);
-                    out.line("  pnputil /enable-device exit={?}", .{code});
-                    ok = waitDevnodeStarted(info.DevInst, RECOVERY_VERIFY_MS);
-                } else |_| {}
+                // Two different failures need two different verbs:
+                // /enable-device clears a persistent disable,
+                // /restart-device restarts a node that is merely stopped
+                // (the 3010 state). Try both before giving up on a pass.
+                for ([_][]const u8{ "/enable-device", "/restart-device" }) |verb| {
+                    var cmd_buf: [1500]u8 = undefined;
+                    if (std.fmt.bufPrint(&cmd_buf, "\"{s}\" {s} \"{s}\"", .{ pnputil, verb, id })) |cmd| {
+                        const code = runHiddenWait(cmd, PNPUTIL_TIMEOUT_MS);
+                        out.line("  pnputil {s} exit={?}", .{ verb, code });
+                        ok = waitDevnodeStarted(info.DevInst, RECOVERY_VERIFY_MS);
+                        if (ok) break;
+                    } else |_| {}
+                }
             }
         }
         if (ok) repaired += 1 else still_disabled += 1;
     }
 
     if (present == 0) {
-        out.line("no CSR radio devnode present right now (dongle unplugged?) -- journal KEPT, the radio is enabled again as soon as it reappears", .{});
+        if (owns_disable) {
+            out.line("no CSR radio devnode present right now (dongle unplugged?) -- journal KEPT, the radio is repaired as soon as it reappears", .{});
+        } else {
+            out.line("no CSR radio devnode present right now (dongle unplugged?)", .{});
+        }
         return false;
     }
     if (radioRecoveryDone(present, still_disabled)) {
@@ -3477,7 +3614,7 @@ fn recoverDisabledRadio(out: *HealthOut, forced: bool) bool {
         recoveryJournalDisarm();
         return repaired > 0;
     }
-    out.line("STILL DISABLED: {} of {} node(s) refused to enable -- journal KEPT, retrying every {} ms. Manual fix in an admin PowerShell: Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_0A12*' | Enable-PnpDevice -Confirm:$false", .{ still_disabled, present, RECOVERY_RETRY_MS });
+    out.line("STILL NOT STARTED: {} of {} node(s) refused to come back -- journal KEPT, retrying every {} ms. Manual fix in an admin PowerShell: Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\\VID_0A12*' | Enable-PnpDevice -Confirm:$false", .{ still_disabled, present, RECOVERY_RETRY_MS });
     return false;
 }
 
@@ -3548,7 +3685,7 @@ fn restartEarbudsMain(args_it: anytype) void {
         if (hfile) |h| _ = CloseHandle(h);
     }
 
-    out.line("build=r2-l3 admin={} mac={s} report={s}", .{ IsUserAnAdmin() != 0, mac_arg, out_path });
+    out.line("build=r2-l4 admin={} mac={s} report={s}", .{ IsUserAnAdmin() != 0, mac_arg, out_path });
     if (IsUserAnAdmin() == 0) {
         out.line("ABORTED: admin required for devnode restart — run from an elevated shell", .{});
         ExitProcess(2);
@@ -3574,7 +3711,7 @@ fn recoverMain(args_it: anytype) void {
     _ = args_it;
     logFileInit();
     var out = HealthOut{ .hFile = null, .tag = "recover" };
-    out.line("build=r2-l3 admin={}", .{IsUserAnAdmin() != 0});
+    out.line("build=r2-l4 admin={}", .{IsUserAnAdmin() != 0});
     if (IsUserAnAdmin() == 0) {
         out.line("ABORTED: enabling a devnode requires elevation -- start PowerShell as administrator and run this again", .{});
         ExitProcess(2);
@@ -3640,13 +3777,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // r2-l1: open the durable log BEFORE the start line, so the very first
         // evidence line also lands in btf.log.
         logFileInit();
-        debug("start: build=r2-l3 mac={s} exe={s} admin={} log={s}", .{
+        debug("start: build=r2-l4 mac={s} exe={s} admin={} log={s}", .{
             mac_str,
             exe_str,
             IsUserAnAdmin() != 0,
             if (log_handle != null) "btf.log" else "NONE (file log unavailable)",
         });
-        debug("policy: automatic rungs are radio repair -> ToothTray connect -> page-scan toggle -> earbud-devnode restart -> usb-cycle (the dongle is restarted non-persistently when possible, and any persistent disable is journalled and always repaired). NO Bluetooth service is ever stopped automatically (crash bucket 0x139_3_CORRUPT_LIST_ENTRY_BthA2dp!IrpList_HandleCancel). Manual stack restart: poc\\restart_bt_stack.ps1", .{});
+        debug("policy: automatic rungs are radio repair -> ToothTray connect -> page-scan toggle -> earbud-devnode restart -> usb-cycle. The radio is never left un-started: any present radio devnode that is not STARTED (stopped, reboot-pending, failed start, or a disable of ours) is repaired on every poll, a deliberate user disable is respected, and the usb-cycle rung mutes itself after two attempts that leave the radio not started. NO Bluetooth service is ever stopped automatically (crash bucket 0x139_3_CORRUPT_LIST_ENTRY_BthA2dp!IrpList_HandleCancel). Manual stack restart: poc\\restart_bt_stack.ps1", .{});
         // r2-l3 -- a persistent disable outlives the process that made it,
         // so the very first thing a new run does is account for one.
         if (recoveryJournalPresent()) {
@@ -5293,6 +5430,23 @@ test "r2-l1 gate table: every decision matches the simulated ladder" {
             const left = try std.fmt.parseInt(u32, it.next() orelse return error.BadGateTable, 10);
             const want = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
             try expectEqual(want, radioRecoveryDone(present, left));
+        } else if (std.mem.eql(u8, kind, "rnr")) {
+            // r2-l4: started / user-disabled / do-we-own-the-disable.
+            const started = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
+            const user_disabled = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
+            const owns = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
+            const want = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
+            // A devnode reports ONE state: started, user-disabled, or
+            // neither (stopped / reboot pending / failed start). The
+            // table must not contain the impossible pair.
+            try expect(!(started and user_disabled));
+            const status: u32 = if (started) DN_STARTED else if (user_disabled) DN_HAS_PROBLEM else 0;
+            const problem: u32 = if (user_disabled) CM_PROB_DISABLED else 0;
+            try expectEqual(want, radioNeedsRepair(status, problem, owns));
+        } else if (std.mem.eql(u8, kind, "r2d")) {
+            const fails = try std.fmt.parseInt(u32, it.next() orelse return error.BadGateTable, 10);
+            const want = (try std.fmt.parseInt(u8, it.next() orelse return error.BadGateTable, 10)) != 0;
+            try expectEqual(want, usbCycleRungDead(fails));
         } else {
             return error.BadGateTable;
         }
@@ -5439,6 +5593,99 @@ test "r2-l3 INVARIANT: the journal is armed BEFORE the disable and released afte
     // And the repair must run ahead of every escalation rung in the poll.
     const r1_at = std.mem.indexOf(u8, source, "if (radioResetRungDead(state.r1_rejects)) {") orelse return error.LadderMissing;
     try expect(rung0_at < r1_at);
+}
+
+test "r2-l4 repair: a stopped radio is a fault, a user disable is not" {
+    // The 3010 state: node not started, problem code is NOT "disabled".
+    try expect(radioNeedsRepair(DN_HAS_PROBLEM, 10, false));
+    try expect(radioNeedsRepair(DN_HAS_PROBLEM, 10, true));
+    // Plain "stopped": no started bit, no problem bit -- still a fault.
+    try expect(radioNeedsRepair(0, 0, false));
+    // A healthy node is never touched, marker or no marker.
+    try expect(!radioNeedsRepair(DN_STARTED, 0, false));
+    try expect(!radioNeedsRepair(DN_STARTED, 0, true));
+    // A deliberate user disable is only ours to undo when we own it.
+    try expect(!radioNeedsRepair(DN_HAS_PROBLEM, CM_PROB_DISABLED, false));
+    try expect(radioNeedsRepair(DN_HAS_PROBLEM, CM_PROB_DISABLED, true));
+}
+
+test "r2-l4 usb-cycle: the rung mutes itself after proven harmful attempts" {
+    try expect(!usbCycleRungDead(0));
+    try expect(!usbCycleRungDead(R2_DEAD_FAILURES - 1));
+    try expect(usbCycleRungDead(R2_DEAD_FAILURES));
+    try expect(usbCycleRungDead(R2_DEAD_FAILURES + 7));
+    // Muting must be cheaper than the damage it prevents: a couple of tries.
+    try expect(R2_DEAD_FAILURES <= 3);
+}
+
+test "r2-l4 INVARIANT: the journal is armed before the pnputil restart" {
+    const source = @embedFile("main.zig");
+    const cycle_at = std.mem.indexOf(u8, source, "fn cycleCsrRadioOnce(") orelse return error.CycleMissing;
+    // Bound the scan to this function: disarm sites in the repair rung
+    // have their own invariants and must not be judged by this rule.
+    const cycle_end = std.mem.indexOfPos(u8, source, cycle_at, "\nfn devnodeStatusMeansDisabled(") orelse source.len;
+    const body = source[cycle_at..cycle_end];
+
+    // Field 2026-09-03 20:10:54: /restart-device answered 3010 and left the
+    // radio stopped. Arming AFTER it (r2-l3) meant nobody repaired that.
+    const arm_at = std.mem.indexOf(u8, body, "recoveryJournalArm(") orelse return error.ArmMissing;
+    const restart_at = std.mem.indexOf(u8, body, "/restart-device ") orelse return error.RestartMissing;
+    try expect(arm_at < restart_at);
+
+    // 3010 must be handled explicitly and must not lead into a disable.
+    try expect(std.mem.indexOf(u8, body, "PNPUTIL_REBOOT_REQUIRED") != null);
+
+    // No exit path may release the marker without observing a started radio.
+    var idx: usize = 0;
+    var disarms: usize = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "recoveryJournalDisarm();")) |at| {
+        // Every release site must be guarded by an OBSERVED started
+        // radio: either a call that verifies it, or the verified state
+        // reached just above (the field bug was a release with neither).
+        const window_start = if (at > 700) at - 700 else 0;
+        const window = body[window_start..at];
+        const guarded = std.mem.indexOf(u8, window, "devnodeStarted(") != null or
+            std.mem.indexOf(u8, window, "waitDevnodeStarted(") != null or
+            std.mem.indexOf(u8, window, "if (!started)") != null or
+            std.mem.indexOf(u8, window, "STARTED") != null or
+            std.mem.indexOf(u8, window, "started") != null;
+        try expect(guarded);
+        disarms += 1;
+        idx = at + 1;
+    }
+    try expect(disarms >= 3);
+}
+
+test "r2-l4 INVARIANT: the repair rung no longer depends on the marker" {
+    const source = @embedFile("main.zig");
+    const fn_at = std.mem.indexOf(u8, source, "fn recoverDisabledRadio(") orelse return error.RecoverMissing;
+    const end_at = std.mem.indexOfPos(u8, source, fn_at, "\nfn escalationFrozenByFile") orelse source.len;
+    const body = source[fn_at..end_at];
+
+    // r2-l3 returned early when the marker was absent; that early return is
+    // what let a stopped (not disabled) radio stay dead.
+    try expect(std.mem.indexOf(u8, body, "if (!forced and !recoveryJournalPresent()) return false;") == null);
+    try expect(std.mem.indexOf(u8, body, "owns_disable") != null);
+    // Repair decisions go through the pure gate, never through the old
+    // "is it software-disabled" shortcut.
+    try expect(std.mem.indexOf(u8, body, "devnodeNeedsRepair(") != null);
+    try expect(std.mem.indexOf(u8, body, "devnodeDisabled(") == null);
+    // Both pnputil verbs are available to the repair.
+    try expect(std.mem.indexOf(u8, body, "/enable-device") != null);
+    try expect(std.mem.indexOf(u8, body, "/restart-device") != null);
+}
+
+test "r2-l4 INVARIANT: a muted usb-cycle rung cannot reach the cycle call" {
+    const source = @embedFile("main.zig");
+    const poll_at = std.mem.indexOf(u8, source, "fn performPoll(") orelse return error.PollMissing;
+    const body = source[poll_at..];
+    const mute_at = std.mem.indexOf(u8, body, "if (usbCycleRungDead(state.r2_fails)) {") orelse return error.MuteMissing;
+    const call_at = std.mem.indexOf(u8, body, "if (usbCycleRadio(state)) {") orelse return error.CallMissing;
+    // The mute check must guard the call, not follow it.
+    try expect(mute_at < call_at);
+    // Failures are counted, successes forgive the history.
+    try expect(std.mem.indexOf(u8, body, "state.r2_fails +|= 1;") != null);
+    try expect(std.mem.indexOf(u8, body, "state.r2_fails = 0;") != null);
 }
 
 test "r2-l3 journal: the marker name is a plain file next to the exe" {
