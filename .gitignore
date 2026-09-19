@@ -13,3 +13,6 @@ btf_*.txt
 .vscode/
 *.orig
 Thumbs.db
+
+# Local-only legacy Zig copy (never commit, see branch zig)
+zig/
