@@ -1,0 +1,26 @@
+[package]
+name = "bluetooth-force"
+version = "3.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Keep paired Bluetooth earbuds connected, with a native reconnect path and a verified recovery ladder."
+publish = false
+
+[[bin]]
+name = "bluetooth_force"
+path = "src/main.rs"
+
+# Zero external crates on purpose: every Win32 entry point is declared by hand
+# in `src/sys`, so the binary builds fully offline and the ABI contract stays
+# explicit and reviewable.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+# Unit tests and debug runs keep unwinding so failures are catchable.
