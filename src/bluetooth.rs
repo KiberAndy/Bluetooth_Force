@@ -21,7 +21,7 @@ type FnEnableIncoming = unsafe extern "system" fn(HANDLE, i32) -> BOOL;
 type FnGetRadioInfo = unsafe extern "system" fn(HANDLE, *mut BLUETOOTH_RADIO_INFO) -> u32;
 type FnIsDiscoverable = unsafe extern "system" fn(HANDLE) -> BOOL;
 type FnIsConnectable = unsafe extern "system" fn(HANDLE) -> BOOL;
-type FnSetServiceState =
+pub type FnSetServiceState =
     unsafe extern "system" fn(HANDLE, *const BLUETOOTH_DEVICE_INFO, *const crate::sys::GUID, u32) -> u32;
 
 fn load_sym<T: Copy>(module: HMODULE, name: &str) -> Option<T> {

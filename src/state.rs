@@ -15,6 +15,12 @@ pub struct SharedState {
     pub running: AtomicBool,
     pub target_mac: u64,
     pub resume_event: HANDLE,
+    /// Set by the hidden window on `DBT_DEVNODES_CHANGED`: "go poll now".
+    pub device_event: HANDLE,
+    /// When the last device-change-driven poll ran (0 = never).
+    pub device_wake_last_ms: i64,
+    pub device_wakes: u32,
+    pub device_wakes_coalesced: u32,
     pub bth: BthApi,
     pub keepalive: SilentKeepalive,
 
@@ -23,6 +29,16 @@ pub struct SharedState {
     pub next_connect_ms: i64,
     // L5 — reconnect storm cap.
     pub connect_breaker: CircuitBreaker,
+    // Reconnect toggle (profile-driver re-install) rate limit.
+    pub connect_toggle_last_ms: i64,
+    pub connect_toggle_fails: u32,
+    pub connect_inert_logged: bool,
+    /// When the current link came up (0 = link is down).
+    pub link_up_since_ms: i64,
+    /// When the current down episode started (0 = no episode).
+    pub down_since_ms: i64,
+    /// The "replug the dongle by hand" verdict was printed once already.
+    pub hard_wedge_logged: bool,
 
     // L6 — paged-pool watchdog.
     pub pool_min_bytes: u64,
@@ -85,11 +101,21 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    pub fn new(target_mac: u64, resume_event: HANDLE, bth: BthApi, keepalive: SilentKeepalive) -> Self {
+    pub fn new(
+        target_mac: u64,
+        resume_event: HANDLE,
+        device_event: HANDLE,
+        bth: BthApi,
+        keepalive: SilentKeepalive,
+    ) -> Self {
         Self {
             running: AtomicBool::new(true),
             target_mac,
             resume_event,
+            device_event,
+            device_wake_last_ms: 0,
+            device_wakes: 0,
+            device_wakes_coalesced: 0,
             bth,
             keepalive,
             connect_fails: 0,
@@ -99,6 +125,12 @@ impl SharedState {
                 CONNECT_CB_MAX_EVENTS,
                 CONNECT_CB_COOLDOWN_MS,
             ),
+            connect_toggle_last_ms: 0,
+            connect_toggle_fails: 0,
+            connect_inert_logged: false,
+            link_up_since_ms: 0,
+            down_since_ms: 0,
+            hard_wedge_logged: false,
             pool_min_bytes: u64::MAX,
             watchdog_tripped: false,
             watchdog_tripped_ms: 0,

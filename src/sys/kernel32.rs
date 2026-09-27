@@ -91,6 +91,12 @@ unsafe extern "system" {
     ) -> HANDLE;
     pub fn SetEvent(hEvent: HANDLE) -> BOOL;
     pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
+    pub fn WaitForMultipleObjects(
+        nCount: u32,
+        lpHandles: *const HANDLE,
+        bWaitAll: BOOL,
+        dwMilliseconds: u32,
+    ) -> u32;
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
     pub fn CreateFileW(
         lpFileName: *const u16,

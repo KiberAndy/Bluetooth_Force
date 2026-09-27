@@ -13,6 +13,25 @@ use crate::sys::SYSTEMTIME;
 use crate::util;
 
 static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+/// Redaction is on unless `btf_nocensor.txt` sits next to the exe. Cached: the
+/// switch is read once, not on every line.
+static CENSOR: OnceLock<bool> = OnceLock::new();
+
+/// Name of the opt-out switch, in the same style as `btf_freeze.txt`.
+pub const NOCENSOR_NAME: &str = "btf_nocensor.txt";
+
+fn censor_enabled() -> bool {
+    *CENSOR.get_or_init(|| !util::self_dir_path(NOCENSOR_NAME).is_some_and(|p| p.exists()))
+}
+
+/// Redact one line unless the opt-out switch is present.
+pub fn scrub(msg: &str) -> std::borrow::Cow<'_, str> {
+    if censor_enabled() {
+        std::borrow::Cow::Owned(crate::redact::redact_line(msg))
+    } else {
+        std::borrow::Cow::Borrowed(msg)
+    }
+}
 
 /// Open (and rotate) the durable log. Idempotent.
 pub fn init() {
@@ -46,6 +65,8 @@ fn timestamp() -> String {
 
 /// Emit one already-formatted line.
 pub fn write_line(msg: &str) {
+    let msg: &str = &scrub(msg);
+
     // DebugView / attached debugger channel.
     let dbg = format!("btf: {msg}\0");
     unsafe { kernel32::OutputDebugStringA(dbg.as_ptr()) };

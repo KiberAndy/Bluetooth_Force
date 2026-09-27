@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::btlog;
 use crate::config::*;
+use crate::endpoint::{ranked_formats, select_audio_device, WaveFormatSpec};
 use crate::ladder::{backoff_ms, CircuitBreaker};
 use crate::sys::kernel32::Sleep;
 use crate::sys::HANDLE;
@@ -36,58 +37,15 @@ pub fn fill_keepalive_buffer(buf: &mut [u8]) {
     }
 }
 
-fn is_fxsound_name(name: &str) -> bool {
-    util::contains_ignore_case(name.as_bytes(), b"fxsound")
-        || util::contains_ignore_case(name.as_bytes(), b"fx sound")
-}
-
-/// Pick the waveOut device that routes the keepalive directly to the earbuds,
-/// bypassing FxSound's default-device APO.
-///
-/// 1. If `override_name` is set, return the first device whose name contains it.
-/// 2. Otherwise match any ≥4-char alphanumeric token of the Bluetooth name,
-///    skipping FxSound endpoints.
-///
-/// `None` means "fall back to WAVE_MAPPER".
-pub fn select_audio_device(
-    names: &[String],
-    bt_name: &str,
-    override_name: Option<&str>,
-) -> Option<usize> {
-    if let Some(ov) = override_name {
-        if !ov.is_empty() {
-            return names.iter().position(|n| util::contains_ignore_case(n.as_bytes(), ov.as_bytes()));
-        }
-    }
-
-    let bytes = bt_name.as_bytes();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i <= bytes.len() {
-        let at_end = i == bytes.len();
-        let is_sep = at_end || !bytes[i].is_ascii_alphanumeric();
-        if is_sep {
-            let token = &bytes[start..i];
-            if token.len() >= 4 {
-                if let Some(idx) = names
-                    .iter()
-                    .position(|n| !is_fxsound_name(n) && util::contains_ignore_case(n.as_bytes(), token))
-                {
-                    return Some(idx);
-                }
-            }
-            start = i + 1;
-        }
-        i += 1;
-    }
-    None
-}
-
 /// State shared with the keepalive worker thread. The buffer lives here so its
 /// address stays stable for the driver across the whole session.
 struct KeepaliveInner {
     want_run: AtomicBool,
+    /// Resolved fresh before every session; only kept for diagnostics.
     device_id: AtomicU32,
+    /// Bluetooth name the endpoint is matched against, plus the user override.
+    bt_name: Mutex<String>,
+    override_name: Option<String>,
     consec_fails: AtomicU32,
     breaker: Mutex<CircuitBreaker>,
     buffer: Box<[u8; KEEPALIVE_BUF_SIZE]>,
@@ -98,7 +56,6 @@ struct KeepaliveInner {
 pub struct SilentKeepalive {
     inner: Arc<KeepaliveInner>,
     thread: Option<JoinHandle<()>>,
-    override_name: Option<String>,
 }
 
 impl SilentKeepalive {
@@ -109,6 +66,8 @@ impl SilentKeepalive {
             inner: Arc::new(KeepaliveInner {
                 want_run: AtomicBool::new(false),
                 device_id: AtomicU32::new(WAVE_MAPPER),
+                bt_name: Mutex::new(String::new()),
+                override_name,
                 consec_fails: AtomicU32::new(0),
                 breaker: Mutex::new(CircuitBreaker::new(
                     KEEPALIVE_CB_WINDOW_MS,
@@ -118,7 +77,6 @@ impl SilentKeepalive {
                 buffer,
             }),
             thread: None,
-            override_name,
         }
     }
 
@@ -136,7 +94,10 @@ impl SilentKeepalive {
         if self.thread.is_some() {
             return;
         }
-        self.resolve_device(bt_name);
+        if let Ok(mut n) = self.inner.bt_name.lock() {
+            n.clear();
+            n.push_str(bt_name);
+        }
         self.inner.want_run.store(true, Ordering::Release);
         let inner = Arc::clone(&self.inner);
         match thread::Builder::new().name("keepalive".into()).spawn(move || run(inner)) {
@@ -157,37 +118,50 @@ impl SilentKeepalive {
             let _ = handle.join();
         }
     }
+}
 
-    /// Enumerate waveOut endpoints and pick the earbuds' own device so the
-    /// keepalive bypasses the FxSound default-device APO. Best-effort: on any
-    /// failure it leaves `device_id = WAVE_MAPPER`.
-    fn resolve_device(&mut self, bt_name: &str) {
-        let n = unsafe { waveOutGetNumDevs() };
-        if n == 0 {
-            self.inner.device_id.store(WAVE_MAPPER, Ordering::Release);
-            return;
+/// Enumerate the waveOut endpoints and resolve the earbuds' own device.
+///
+/// Run before EVERY session: re-installing the A2DP driver renumbers the
+/// waveOut list, so a cached index can point at the wrong device -- or at none.
+/// `None` means "fall back to WAVE_MAPPER".
+fn resolve_endpoint(inner: &KeepaliveInner) -> (u32, u32) {
+    let n = unsafe { waveOutGetNumDevs() };
+    if n == 0 {
+        btlog!("keepalive: no waveOut endpoint exists right now");
+        return (WAVE_MAPPER, 0);
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    let mut formats: Vec<u32> = Vec::new();
+    for dev in 0..n {
+        let mut caps = WAVEOUTCAPSW::default();
+        let rc = unsafe {
+            waveOutGetDevCapsW(dev as usize, &mut caps, std::mem::size_of::<WAVEOUTCAPSW>() as u32)
+        };
+        if rc != 0 {
+            continue;
         }
+        names.push(util::utf16_field(&caps.szPname));
+        formats.push(caps.dwFormats);
+    }
 
-        let mut names: Vec<String> = Vec::new();
-        for dev in 0..n {
-            let mut caps = WAVEOUTCAPSW::default();
-            let rc = unsafe {
-                waveOutGetDevCapsW(dev as usize, &mut caps, std::mem::size_of::<WAVEOUTCAPSW>() as u32)
-            };
-            if rc != 0 {
-                continue;
+    let bt_name = inner.bt_name.lock().map(|n| n.clone()).unwrap_or_default();
+    match select_audio_device(&names, &bt_name, inner.override_name.as_deref()) {
+        Some(idx) => {
+            let previous = inner.device_id.load(Ordering::Acquire);
+            if previous != idx as u32 {
+                btlog!(
+                    "keepalive -> endpoint #{idx} ({}) dwFormats=0x{:x}",
+                    names[idx],
+                    formats[idx]
+                );
             }
-            let name = util::utf16_field(&caps.szPname);
-            btlog!("waveOut[{dev}] = {name}");
-            names.push(name);
+            (idx as u32, formats[idx])
         }
-
-        if let Some(idx) = select_audio_device(&names, bt_name, self.override_name.as_deref()) {
-            self.inner.device_id.store(idx as u32, Ordering::Release);
-            btlog!("keepalive -> endpoint #{idx} ({})", names[idx]);
-        } else {
-            self.inner.device_id.store(WAVE_MAPPER, Ordering::Release);
-            btlog!("keepalive -> WAVE_MAPPER (no earbud endpoint matched)");
+        None => {
+            btlog!("keepalive -> WAVE_MAPPER (no earbud endpoint matched among {} device(s))", names.len());
+            (WAVE_MAPPER, 0)
         }
     }
 }
@@ -208,7 +182,9 @@ fn run(inner: Arc<KeepaliveInner>) {
             }
         }
 
-        let opened = run_session(&inner);
+        let (device_id, dw_formats) = resolve_endpoint(&inner);
+        inner.device_id.store(device_id, Ordering::Release);
+        let opened = run_session(&inner, device_id, dw_formats);
         if opened {
             fails = 0;
         } else {
@@ -233,6 +209,19 @@ fn interruptible_sleep(inner: &KeepaliveInner, total_ms: u32) {
         let slice = 50u32.min(total_ms - slept);
         unsafe { Sleep(slice) };
         slept += slice;
+    }
+}
+
+/// Build a `WAVEFORMATEX` for one candidate spec.
+fn wave_format(spec: WaveFormatSpec) -> WAVEFORMATEX {
+    WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM,
+        nChannels: spec.channels,
+        nSamplesPerSec: spec.sample_rate,
+        nAvgBytesPerSec: spec.avg_bytes_per_sec(),
+        nBlockAlign: spec.block_align(),
+        wBitsPerSample: spec.bits,
+        cbSize: 0,
     }
 }
 
@@ -268,22 +257,36 @@ fn read_flags(hdr: *mut WAVEHDR) -> u32 {
 
 /// One open → prepare → play → close session. Returns `true` if the device
 /// opened (regardless of how it ended).
-fn run_session(inner: &KeepaliveInner) -> bool {
-    let fmt = WAVEFORMATEX {
-        wFormatTag: WAVE_FORMAT_PCM,
-        nChannels: 2,
-        nSamplesPerSec: 44_100,
-        nAvgBytesPerSec: 176_400,
-        nBlockAlign: 4,
-        wBitsPerSample: 16,
-        cbSize: 0,
-    };
-
+fn run_session(inner: &KeepaliveInner, device_id: u32, dw_formats: u32) -> bool {
+    // Negotiate instead of assuming: a 48 kHz-only A2DP endpoint answers
+    // 44.1 kHz with WAVERR_BADFORMAT (32), which used to fail the session
+    // silently and let the earbuds idle-drop the link.
     let mut hwo: HANDLE = ptr::null_mut();
-    let device_id = inner.device_id.load(Ordering::Acquire);
-    if unsafe { waveOutOpen(&mut hwo, device_id, &fmt, 0, 0, CALLBACK_NULL) } != 0 {
-        return false;
+    let mut opened_spec: Option<WaveFormatSpec> = None;
+    for spec in ranked_formats(dw_formats) {
+        let fmt = wave_format(spec);
+        let rc = unsafe { waveOutOpen(&mut hwo, device_id, &fmt, 0, 0, CALLBACK_NULL) };
+        if rc == 0 {
+            opened_spec = Some(spec);
+            break;
+        }
+        btlog!(
+            "keepalive: waveOutOpen(dev=#{device_id}, {} Hz/{} ch/{} bit) failed mmsys={rc}",
+            spec.sample_rate,
+            spec.channels,
+            spec.bits
+        );
     }
+    let Some(spec) = opened_spec else {
+        btlog!("keepalive: no supported format on endpoint #{device_id} -- session not opened");
+        return false;
+    };
+    btlog!(
+        "keepalive: streaming on endpoint #{device_id} at {} Hz/{} ch/{} bit",
+        spec.sample_rate,
+        spec.channels,
+        spec.bits
+    );
 
     let mut hdr = WAVEHDR {
         lpData: inner.buffer.as_ptr() as *mut u8,
@@ -294,14 +297,18 @@ fn run_session(inner: &KeepaliveInner) -> bool {
     };
     let hdr_ptr: *mut WAVEHDR = &mut hdr;
 
-    if unsafe { waveOutPrepareHeader(hwo, hdr_ptr, std::mem::size_of::<WAVEHDR>() as u32) } != 0 {
+    let rc = unsafe { waveOutPrepareHeader(hwo, hdr_ptr, std::mem::size_of::<WAVEHDR>() as u32) };
+    if rc != 0 {
+        btlog!("keepalive: waveOutPrepareHeader failed mmsys={rc}");
         unsafe { waveOutClose(hwo) };
         return false;
     }
 
     let mut guard = SessionGuard { hwo, hdr: hdr_ptr, queued: false };
 
-    if unsafe { waveOutWrite(hwo, hdr_ptr, std::mem::size_of::<WAVEHDR>() as u32) } != 0 {
+    let rc = unsafe { waveOutWrite(hwo, hdr_ptr, std::mem::size_of::<WAVEHDR>() as u32) };
+    if rc != 0 {
+        btlog!("keepalive: waveOutWrite failed mmsys={rc}");
         return false;
     }
     guard.queued = true;
@@ -364,19 +371,6 @@ mod tests {
         assert_eq!(odd[4], 0);
         assert_eq!(odd[0], 1);
         assert_eq!(odd[1], 0);
-    }
-
-    #[test]
-    fn device_selection() {
-        let names = vec![
-            "Speakers (FxSound Audio Enhancer)".to_string(),
-            "Headphones (WF-1000XM5 Stereo)".to_string(),
-            "Realtek HD Audio".to_string(),
-        ];
-        assert_eq!(select_audio_device(&names, "WF-1000XM5", None), Some(1));
-        assert_eq!(select_audio_device(&names, "XY", None), None);
-        assert_eq!(select_audio_device(&names, "WF-1000XM5", Some("realtek")), Some(2));
-        assert_eq!(select_audio_device(&names, "WF-1000XM5", Some("nope")), None);
     }
 
     #[test]

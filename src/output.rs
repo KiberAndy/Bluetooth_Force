@@ -30,7 +30,8 @@ impl HealthOut {
 
     pub fn line(&self, body: &str) {
         if let Some(f) = self.file.borrow_mut().as_mut() {
-            let _ = f.write_all(body.as_bytes());
+            // The report is shared like the log, so it is redacted the same way.
+            let _ = f.write_all(crate::log::scrub(body).as_bytes());
             let _ = f.write_all(b"\r\n");
         }
         btlog!("{}: {}", self.tag, body);

@@ -1,9 +1,16 @@
-//! Hidden popup window that receives `WM_POWERBROADCAST`.
+//! Hidden popup window that receives `WM_POWERBROADCAST` and
+//! `WM_DEVICECHANGE`.
 //!
-//! The worker sleeps on the resume event, and a resume broadcast sets it so the
-//! poll cadence restarts immediately instead of waiting out a sleep. The window
-//! must be a real top-level popup (a `HWND_MESSAGE` window does not receive
-//! broadcasts).
+//! The worker sleeps on two events and this window sets them: a resume
+//! broadcast restarts the poll cadence immediately instead of waiting out a
+//! sleep, and a device-tree change wakes the poll the moment a Bluetooth audio
+//! link appears or disappears (Windows creates/removes BTHENUM devnodes for
+//! it). The window must be a real top-level popup: a `HWND_MESSAGE` window
+//! receives neither broadcast.
+//!
+//! `DBT_DEVNODES_CHANGED` needs no `RegisterDeviceNotification` — it is
+//! broadcast to all top-level windows — which is why this costs no extra FFI
+//! surface.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -14,11 +21,31 @@ use crate::sys::user32::*;
 use crate::sys::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use crate::util;
 
+/// The two events the window signals. Passed to `CreateWindowExW` and kept
+/// alive by [`MessageWindow`] for as long as the window can run its proc.
+#[repr(C)]
+pub struct WakeEvents {
+    pub resume: HANDLE,
+    pub device: HANDLE,
+}
+
+/// Signal one of the wake events, if the window has its pointer installed.
+unsafe fn signal(hwnd: HWND, pick: fn(&WakeEvents) -> HANDLE) {
+    let p = unsafe { get_userdata(hwnd, GWLP_USERDATA) } as *const WakeEvents;
+    if p.is_null() {
+        return;
+    }
+    let ev = pick(unsafe { &*p });
+    if !ev.is_null() {
+        unsafe { kernel32::SetEvent(ev) };
+    }
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
-            // Install the resume-event handle as early as possible so a resume
-            // broadcast racing window creation is never lost.
+            // Install the event pointer as early as possible so a broadcast
+            // racing window creation is never lost.
             let cs = lparam as *const CREATESTRUCTW;
             if !cs.is_null() {
                 let ev = unsafe { (*cs).lpCreateParams } as isize;
@@ -30,10 +57,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_POWERBROADCAST => {
             if wparam == PBT_APMRESUMEAUTOMATIC {
-                let ev = unsafe { get_userdata(hwnd, GWLP_USERDATA) };
-                if ev != 0 {
-                    unsafe { kernel32::SetEvent(ev as HANDLE) };
-                }
+                unsafe { signal(hwnd, |e| e.resume) };
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_DEVICECHANGE => {
+            // Only the detail-free "something appeared or disappeared" event is
+            // used. The worker treats it as "poll now", never as a verdict, and
+            // debounces the burst Windows sends for a single link change.
+            if wparam == DBT_DEVNODES_CHANGED {
+                unsafe { signal(hwnd, |e| e.device) };
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -51,10 +84,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 pub struct MessageWindow {
     hwnd: HWND,
+    /// Owned by the window for its whole lifetime: `window_proc` dereferences
+    /// this pointer. Dropped only after `DestroyWindow` in `Drop`.
+    _events: Box<WakeEvents>,
 }
 
 impl MessageWindow {
-    pub fn create(resume_event: HANDLE) -> Result<Self, &'static str> {
+    pub fn create(resume_event: HANDLE, device_event: HANDLE) -> Result<Self, &'static str> {
+        let events = Box::new(WakeEvents { resume: resume_event, device: device_event });
         let hinstance: HINSTANCE = unsafe { kernel32::GetModuleHandleW(ptr::null()) };
         if hinstance.is_null() {
             return Err("GetModuleHandleW failed");
@@ -94,13 +131,13 @@ impl MessageWindow {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 hinstance,
-                resume_event as *mut c_void,
+                events.as_ref() as *const WakeEvents as *mut c_void,
             )
         };
         if hwnd.is_null() {
             return Err("CreateWindowExW failed");
         }
-        Ok(Self { hwnd })
+        Ok(Self { hwnd, _events: events })
     }
 
     /// Pump messages until `WM_QUIT`.

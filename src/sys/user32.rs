@@ -7,6 +7,11 @@ pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_NCCREATE: u32 = 0x0081;
 pub const WM_POWERBROADCAST: u32 = 0x0218;
 pub const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+/// Broadcast to every top-level window when the device tree changes.
+pub const WM_DEVICECHANGE: u32 = 0x0219;
+/// The only event this window needs: "a devnode was added or removed".
+/// It carries no detail, so it means "go poll", never "the peer is back".
+pub const DBT_DEVNODES_CHANGED: usize = 0x0007;
 
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;

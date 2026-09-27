@@ -54,6 +54,14 @@ pub fn run_daemon(target_mac: u64, audio_override: Option<String>) {
 
     // A persistent disable outlives the process that made it, so the very first
     // thing a new run does is account for one.
+    if let Some(profile) = crate::connect::debt_profile() {
+        btlog!(
+            "startup: {} was left without its driver by a previous run ({} is armed) -- the first poll re-installs it before any escalation rung",
+            profile.name(),
+            crate::config::SERVICE_DEBT_NAME
+        );
+    }
+
     if recovery::journal_present() {
         btlog!("startup: a pending disable journal was found -- repairing the radio BEFORE the ladder starts");
         let out = HealthOut::debug_only("startup recovery");
@@ -72,12 +80,18 @@ pub fn run_daemon(target_mac: u64, audio_override: Option<String>) {
         crate::exit_err("CreateEventW failed");
     }
 
+    let device_event = unsafe { kernel32::CreateEventW(ptr::null_mut(), 0, 0, ptr::null()) };
+    if device_event.is_null() {
+        crate::exit_err("CreateEventW failed");
+    }
+
     let keepalive = SilentKeepalive::new(audio_override);
-    let mut state = Box::new(SharedState::new(target_mac, resume_event, bth, keepalive));
+    let mut state =
+        Box::new(SharedState::new(target_mac, resume_event, device_event, bth, keepalive));
 
     // Create the window BEFORE spawning the worker: any failure here exits
     // while no worker/keepalive is running.
-    let window = match MessageWindow::create(resume_event) {
+    let window = match MessageWindow::create(resume_event, device_event) {
         Ok(w) => w,
         Err(e) => crate::exit_err(e),
     };

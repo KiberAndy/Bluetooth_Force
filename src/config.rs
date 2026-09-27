@@ -7,6 +7,14 @@
 
 /// Worker poll cadence. Worst-case latency from "earbuds connected" to sound.
 pub const POLL_INTERVAL_MS: u32 = 2_000;
+/// Safety-net poll cadence while the link is UP. The device-change broadcast
+/// is what reacts fast, so this timer only has to catch what the broadcast
+/// cannot deliver.
+pub const POLL_INTERVAL_IDLE_MS: u32 = 20_000;
+/// Minimum gap between two polls triggered by `DBT_DEVNODES_CHANGED`.
+pub const DEVICE_EVENT_DEBOUNCE_MS: i64 = 400;
+/// Log a connect pass that parked the poll loop for at least this long.
+pub const CONNECT_BLOCKING_LOG_MS: i64 = 3_000;
 /// Settle time after a power-resume broadcast before polling.
 pub const RESUME_DELAY_MS: u32 = 3_000;
 
@@ -16,6 +24,36 @@ pub const RESUME_DELAY_MS: u32 = 3_000;
 
 pub const CONNECT_BACKOFF_BASE_MS: u32 = 500;
 pub const CONNECT_BACKOFF_CAP_MS: u32 = 4_000;
+
+/// A refusal ("service already enabled") touched nothing and reached nobody, so
+/// it is retried on the next poll instead of feeding the exponential backoff.
+pub const CONNECT_REFUSED_RETRY_MS: i64 = 1_000;
+/// The reconnect toggle removes and re-installs a profile driver, so it is rate
+/// limited: this is the shortest gap between two toggles.
+pub const CONNECT_TOGGLE_MIN_INTERVAL_MS: i64 = 15_000;
+/// Cap of the toggle's exponential slowdown while the link stays down.
+pub const CONNECT_TOGGLE_MAX_INTERVAL_MS: i64 = 30_000;
+/// Settle time between DISABLE and ENABLE of one profile.
+pub const CONNECT_TOGGLE_QUIET_MS: u32 = 400;
+/// How long the stack gets to bring the link up after a toggle before the next
+/// connect pass runs.
+pub const CONNECT_TOGGLE_SETTLE_MS: i64 = 3_000;
+/// Hard retries of the re-ENABLE: a profile must never be left driverless.
+/// Field evidence: after the driver is removed, the stack answers ENABLE with
+/// ERROR_SERVICE_DOES_NOT_EXIST (0x424) for several seconds until the peer's
+/// SDP records are back, so the retries must span seconds, not milliseconds.
+pub const CONNECT_REENABLE_ATTEMPTS: u32 = 8;
+pub const CONNECT_REENABLE_BASE_MS: u32 = 500;
+pub const CONNECT_REENABLE_CAP_MS: u32 = 4_000;
+/// Crash-safe marker: "we removed a profile driver and have not put it back".
+/// While it exists, restoring that driver outranks every other rung.
+pub const SERVICE_DEBT_NAME: &str = "btf_pending_service_enable.txt";
+
+/// After this long in one unresolved episode with every software rung spent,
+/// the daemon says out loud that only a physical replug is left. CSR clones
+/// (VID_0A12/PID_0001) wedge their HCI processor, and no PnP restart drops
+/// VBUS, so software cannot reset them.
+pub const HARD_WEDGE_MS: i64 = 5 * 60 * 1000;
 
 pub const CONNECT_CB_WINDOW_MS: i64 = 10_000;
 pub const CONNECT_CB_MAX_EVENTS: u32 = 20;
@@ -150,7 +188,7 @@ pub const KEEPALIVE_CB_WINDOW_MS: i64 = 10_000;
 pub const KEEPALIVE_CB_MAX_OPENS: u32 = 30;
 pub const KEEPALIVE_CB_COOLDOWN_MS: i64 = 30_000;
 /// Consecutive failed render sessions that flag the A2DP path as dead.
-pub const KEEPALIVE_DEAD_SESSIONS: u32 = 3;
+pub const KEEPALIVE_DEAD_SESSIONS: u32 = 2;
 /// Makes one buffer play effectively forever (~46ms * 2^31 ≈ years).
 pub const KEEPALIVE_LOOP_COUNT: u32 = 0x7FFF_FFFF;
 
