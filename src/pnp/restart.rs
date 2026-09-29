@@ -66,7 +66,7 @@ pub fn earbud_restart_once(target_mac: u64, out: &HealthOut) -> bool {
         }
         if !crate::mac::is_earbud_audio_node(id.as_str()) {
             skipped_non_audio += 1;
-            out.line_fmt(format!("skip (non-audio, left untouched) {}", id.as_str()));
+            out.detail(format!("skip (non-audio, left untouched) {}", id.as_str()));
             index += 1;
             continue;
         }

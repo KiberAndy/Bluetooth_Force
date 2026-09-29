@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::btlog;
 use crate::config::*;
-use crate::endpoint::{ranked_formats, select_audio_device, WaveFormatSpec};
+use crate::endpoint::{probe_wait_ms, ranked_formats, select_audio_device, WaveFormatSpec};
 use crate::ladder::{backoff_ms, CircuitBreaker};
 use crate::sys::kernel32::Sleep;
 use crate::sys::HANDLE;
@@ -170,6 +170,8 @@ fn resolve_endpoint(inner: &KeepaliveInner) -> (u32, u32) {
 /// exponential backoff and the circuit breaker.
 fn run(inner: Arc<KeepaliveInner>) {
     let mut fails: u32 = 0;
+    // Consecutive sessions that had to fall back to WAVE_MAPPER.
+    let mut unmatched: u32 = 0;
     while inner.want_run.load(Ordering::Acquire) {
         let now = util::now_ms();
         {
@@ -184,7 +186,20 @@ fn run(inner: Arc<KeepaliveInner>) {
 
         let (device_id, dw_formats) = resolve_endpoint(&inner);
         inner.device_id.store(device_id, Ordering::Release);
-        let opened = run_session(&inner, device_id, dw_formats);
+
+        // A WAVE_MAPPER session is a FALLBACK, not a destination: it streams
+        // to the default device, which may not be the earbuds at all. Give it
+        // a deadline so the endpoint list is re-read once the reconnect has
+        // finished publishing the earbud endpoint.
+        let probe_ms = if device_id == WAVE_MAPPER {
+            let ms = probe_wait_ms(unmatched);
+            unmatched = unmatched.saturating_add(1);
+            ms
+        } else {
+            unmatched = 0;
+            0
+        };
+        let opened = run_session(&inner, device_id, dw_formats, probe_ms);
         if opened {
             fails = 0;
         } else {
@@ -257,7 +272,15 @@ fn read_flags(hdr: *mut WAVEHDR) -> u32 {
 
 /// One open → prepare → play → close session. Returns `true` if the device
 /// opened (regardless of how it ended).
-fn run_session(inner: &KeepaliveInner, device_id: u32, dw_formats: u32) -> bool {
+fn run_session(
+    inner: &KeepaliveInner,
+    device_id: u32,
+    dw_formats: u32,
+    // End the session after this long so the caller can re-resolve the
+    // endpoint. 0 = play until stop is requested.
+    probe_ms: u32,
+) -> bool {
+    let deadline = if probe_ms == 0 { 0 } else { util::now_ms() + probe_ms as i64 };
     // Negotiate instead of assuming: a 48 kHz-only A2DP endpoint answers
     // 44.1 kHz with WAVERR_BADFORMAT (32), which used to fail the session
     // silently and let the earbuds idle-drop the link.
@@ -317,6 +340,11 @@ fn run_session(inner: &KeepaliveInner, device_id: u32, dw_formats: u32) -> bool 
     // loop ever does finish, re-arm it once.
     while inner.want_run.load(Ordering::Acquire) {
         unsafe { Sleep(200) };
+        if deadline != 0 && util::now_ms() >= deadline {
+            // Not a failure: the session played fine, it just has to be
+            // rebuilt on the endpoint that may exist by now.
+            return true;
+        }
         if read_flags(hdr_ptr) & WHDR_DONE != 0 {
             unsafe {
                 waveOutUnprepareHeader(hwo, hdr_ptr, std::mem::size_of::<WAVEHDR>() as u32);

@@ -11,6 +11,7 @@
 //! list, and (c) negotiate the format instead of hard-coding 44.1 kHz stereo:
 //! `WAVERR_BADFORMAT` on a 48 kHz-only A2DP endpoint fails exactly like this.
 
+use crate::config::{ENDPOINT_PROBE_BASE_MS, ENDPOINT_PROBE_CAP_MS};
 use crate::text::contains_ignore_case;
 
 fn is_fxsound_name(name: &str) -> bool {
@@ -121,6 +122,29 @@ pub fn ranked_formats(dw_formats: u32) -> Vec<WaveFormatSpec> {
     advertised
 }
 
+/// How long a WAVE_MAPPER fallback session may run before the endpoint list is
+/// re-read (0-based attempt).
+///
+/// The field log showed the earbuds' render endpoint missing for a moment
+/// right after a reconnect: 5 of 8 reconnects started the keepalive on
+/// WAVE_MAPPER, which streams to whatever the DEFAULT device happens to be --
+/// possibly the speakers, in which case the A2DP link gets no audio at all and
+/// the earbuds are free to idle out. The fallback therefore has to be
+/// temporary: re-resolve soon, then back off so a machine that genuinely has
+/// no earbud endpoint does not reopen a session every second forever.
+pub fn probe_wait_ms(attempt: u32) -> u32 {
+    let mut v = ENDPOINT_PROBE_BASE_MS;
+    let mut i = 0;
+    while i < attempt {
+        v = v.saturating_mul(2);
+        if v >= ENDPOINT_PROBE_CAP_MS {
+            return ENDPOINT_PROBE_CAP_MS;
+        }
+        i += 1;
+    }
+    v.min(ENDPOINT_PROBE_CAP_MS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +155,16 @@ mod tests {
             "Headphones (WF-1000XM5 Stereo)".to_string(),
             "Realtek HD Audio".to_string(),
         ]
+    }
+
+    #[test]
+    fn the_wave_mapper_fallback_is_retried_soon_then_backs_off() {
+        assert_eq!(probe_wait_ms(0), ENDPOINT_PROBE_BASE_MS);
+        assert_eq!(probe_wait_ms(1), ENDPOINT_PROBE_BASE_MS * 2);
+        assert_eq!(probe_wait_ms(99), ENDPOINT_PROBE_CAP_MS);
+        // The first re-check has to land within a couple of seconds: that is
+        // the window in which the endpoint actually appeared in the field log.
+        assert!(probe_wait_ms(0) <= 2_000);
     }
 
     #[test]

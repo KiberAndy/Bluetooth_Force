@@ -29,45 +29,7 @@ pub fn utf16_field(buf: &[u16]) -> String {
 
 // The ASCII helpers live in `text` so the pure modules can use them without
 // pulling in this module's Win32 calls.
-pub use crate::text::{ascii_lower, contains_ignore_case};
-
-/// Quote one argument for a Windows command line using the
-/// `CommandLineToArgvW` / MSVCRT rules. Device names are attacker-controlled,
-/// so an embedded quote must not be able to break out and inject arguments.
-pub fn quote_arg(arg: &str) -> String {
-    let bytes = arg.as_bytes();
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('"');
-    let mut i = 0;
-    while i < bytes.len() {
-        let mut backslashes = 0;
-        while i < bytes.len() && bytes[i] == b'\\' {
-            backslashes += 1;
-            i += 1;
-        }
-        if i == bytes.len() {
-            // Trailing backslashes precede the closing quote: double them.
-            for _ in 0..backslashes * 2 {
-                out.push('\\');
-            }
-        } else if bytes[i] == b'"' {
-            // Backslashes before a quote are doubled, then the quote escaped.
-            for _ in 0..backslashes * 2 + 1 {
-                out.push('\\');
-            }
-            out.push('"');
-            i += 1;
-        } else {
-            for _ in 0..backslashes {
-                out.push('\\');
-            }
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out.push('"');
-    out
-}
+pub use crate::text::{ascii_lower, contains_ignore_case, quote_arg};
 
 /// Full path to the running executable, or `None` when it cannot be read.
 pub fn module_file_name() -> Option<String> {

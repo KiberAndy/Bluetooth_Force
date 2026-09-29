@@ -10,6 +10,8 @@
 
 mod app;
 mod audio;
+mod autostart;
+mod autostart_cmd;
 mod bluetooth;
 mod config;
 mod endpoint;
@@ -26,6 +28,7 @@ mod redact;
 mod state;
 mod text;
 mod sys;
+mod dedup;
 mod util;
 mod wake;
 mod window;

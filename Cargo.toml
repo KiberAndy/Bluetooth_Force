@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Keep paired Bluetooth earbuds connected, with a native reconnect path and a verified recovery ladder."
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "bluetooth_force"
@@ -20,7 +21,11 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+# Symbols stay in the binary ON PURPOSE. A stripped, unsigned, metadata-free
+# executable is the shape generic antivirus heuristics punish hardest; keeping
+# the symbol names costs a few hundred KB and makes the binary readable to
+# anyone who wants to check what it does.
+strip = false
 
 [profile.dev]
 # Unit tests and debug runs keep unwinding so failures are catchable.

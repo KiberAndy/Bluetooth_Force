@@ -107,3 +107,75 @@ fn a_silent_wedge_still_relies_on_the_timer() {
     println!("silent wedge: retry cadence stays {new} ms (was {old} ms)");
     assert_eq!(new, old, "the down-link retry cadence must not get slower");
 }
+
+/// Driver churn during a long absence. Field log: the earbuds were away for
+/// 91 minutes and the daemon re-installed the A2DP driver ~100 times, each
+/// pass parking the poll loop for 6.5 s -- none of it could help, because the
+/// peer simply was not there.
+///
+/// Modelled: a poll every 2 s, a toggle pass costing 6.5 s, one GENUINE
+/// external device-tree change every 15 minutes, and an echo broadcast from
+/// each of our own toggles (that is what most of the field log's 416 wakes
+/// were).
+#[test]
+fn a_long_absence_stops_churning_the_driver() {
+    use poc::connect_fsm::toggle_interval_ms;
+
+    const OLD_CAP_MS: i64 = 30_000; // the cap as it shipped
+    const PASS_COST_MS: i64 = 6_500;
+    const HORIZON_MS: i64 = 91 * 60 * 1000;
+    const EXTERNAL_EVENT_MS: i64 = 15 * 60 * 1000;
+
+    fn old_interval(fails: u32) -> i64 {
+        let mut v = 15_000i64;
+        let mut i = 1;
+        while i < fails {
+            v *= 2;
+            if v >= OLD_CAP_MS {
+                return OLD_CAP_MS;
+            }
+            i += 1;
+        }
+        v.min(OLD_CAP_MS)
+    }
+
+    fn run(new: bool) -> u32 {
+        let mut now = 1_000_000i64;
+        let end = now + HORIZON_MS;
+        let mut last_toggle = 0i64;
+        let mut last_unpark = 0i64;
+        let mut fails = 0u32;
+        let mut count = 0u32;
+        while now < end {
+            if new {
+                // Echo of our own toggle: must never unpark. A genuine
+                // external change: may, subject to the floor.
+                let echo = last_toggle != 0 && now - last_toggle < PASS_COST_MS + 2_000;
+                let external = (now - 1_000_000) % EXTERNAL_EVENT_MS == 0;
+                if echo {
+                    assert!(!device_wake_may_unpark(now, last_unpark, last_toggle));
+                } else if external && device_wake_may_unpark(now, last_unpark, last_toggle) {
+                    last_unpark = now;
+                    last_toggle = 0;
+                }
+            }
+            let interval = if new { toggle_interval_ms(fails) } else { old_interval(fails) };
+            if last_toggle == 0 || now - last_toggle >= interval {
+                count += 1;
+                fails += 1;
+                now += PASS_COST_MS;
+                last_toggle = now;
+            }
+            now += 2_000;
+        }
+        count
+    }
+
+    let old = run(false);
+    let new = run(true);
+    println!("91 min absence: {old} driver re-installs before, {new} after");
+    assert!(old >= 90, "the old cap really did churn: {old}");
+    assert!(new * 3 <= old, "expected a large reduction, got {new} vs {old}");
+    // Still responsive: a retry at least every few minutes.
+    assert!(new >= 15, "a 91 min absence must still be retried regularly: {new}");
+}

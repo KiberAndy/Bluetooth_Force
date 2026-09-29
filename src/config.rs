@@ -15,6 +15,33 @@ pub const POLL_INTERVAL_IDLE_MS: u32 = 20_000;
 pub const DEVICE_EVENT_DEBOUNCE_MS: i64 = 400;
 /// Log a connect pass that parked the poll loop for at least this long.
 pub const CONNECT_BLOCKING_LOG_MS: i64 = 3_000;
+/// A device-tree change may cancel the toggle rate limit at most this often.
+/// Without the floor, a busy machine's device events would undo the limit.
+pub const DEVICE_WAKE_UNPARK_MS: i64 = 60_000;
+/// A device-tree change within this long after WE last rewrote the device
+/// tree is almost certainly the ECHO of our own action, not the peer coming
+/// back. Every rung churns the tree: the connect toggle re-installs a profile
+/// driver, R1 toggles page scan, R2/R4 cycle the radio's USB node, R3 restarts
+/// the earbud function devnodes. In the 2026-09-29 field log 24 of 31 unparks
+/// landed within 30 s of one of our own completions -- 17 of them in the SAME
+/// millisecond as `rung earbud-restart: complete` -- so the ladder was
+/// cancelling its own rate limit and buying an extra 6-8.5 s blocking toggle.
+/// Measured from the END of the action, which is why it is stamped on
+/// completion rather than on entry.
+pub const SELF_CHURN_ECHO_MS: i64 = 15_000;
+
+// --- Log de-duplication -----------------------------------------------------
+/// A repeated log line is printed at most once per this window.
+pub const DEDUP_WINDOW_MS: i64 = 60_000;
+/// Distinct messages tracked at once. Small on purpose: the spam is a handful
+/// of lines, and the table is scanned linearly.
+pub const DEDUP_SLOTS: usize = 32;
+
+// --- Keepalive endpoint probing --------------------------------------------
+/// First re-check of the endpoint list after a WAVE_MAPPER fallback.
+pub const ENDPOINT_PROBE_BASE_MS: u32 = 1_000;
+/// Cap for that re-check interval.
+pub const ENDPOINT_PROBE_CAP_MS: u32 = 30_000;
 /// Settle time after a power-resume broadcast before polling.
 pub const RESUME_DELAY_MS: u32 = 3_000;
 
@@ -32,7 +59,11 @@ pub const CONNECT_REFUSED_RETRY_MS: i64 = 1_000;
 /// limited: this is the shortest gap between two toggles.
 pub const CONNECT_TOGGLE_MIN_INTERVAL_MS: i64 = 15_000;
 /// Cap of the toggle's exponential slowdown while the link stays down.
-pub const CONNECT_TOGGLE_MAX_INTERVAL_MS: i64 = 30_000;
+/// Cap for the toggle rate limit. The field log showed ~100 driver
+/// re-installs during a single 90-minute absence, each parking the poll loop
+/// for 6.5 s, none of which could help: the peer simply was not there. A
+/// `link UP`, a resume, or a device-tree change unparks it immediately.
+pub const CONNECT_TOGGLE_MAX_INTERVAL_MS: i64 = 5 * 60 * 1000;
 /// Settle time between DISABLE and ENABLE of one profile.
 pub const CONNECT_TOGGLE_QUIET_MS: u32 = 400;
 /// How long the stack gets to bring the link up after a toggle before the next
@@ -54,6 +85,8 @@ pub const SERVICE_DEBT_NAME: &str = "btf_pending_service_enable.txt";
 /// (VID_0A12/PID_0001) wedge their HCI processor, and no PnP restart drops
 /// VBUS, so software cannot reset them.
 pub const HARD_WEDGE_MS: i64 = 5 * 60 * 1000;
+/// How often the "link has been down for a long time" report may repeat.
+pub const STALL_REPORT_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 pub const CONNECT_CB_WINDOW_MS: i64 = 10_000;
 pub const CONNECT_CB_MAX_EVENTS: u32 = 20;
@@ -197,6 +230,8 @@ pub const KEEPALIVE_LOOP_COUNT: u32 = 0x7FFF_FFFF;
 // ---------------------------------------------------------------------------
 
 pub const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// Opt-out switch for the logon task, in the same style as `btf_freeze.txt`.
+pub const AUTOSTART_OPT_OUT_NAME: &str = "btf_no_autostart.txt";
 pub const LOG_NAME: &str = "btf.log";
 pub const LOG_OLD_NAME: &str = "btf.log.1";
 

@@ -40,4 +40,18 @@ impl HealthOut {
     pub fn line_fmt(&self, body: String) {
         self.line(&body);
     }
+
+    /// Per-item detail (one line per devnode). It goes into an explicitly
+    /// requested report in full, but is dropped from the always-on debug log
+    /// when the rung runs unattended: in the field log the 38 `skip (non-audio)`
+    /// lines were 3% of the file and each one is unique (a different GUID), so
+    /// the de-duplicator cannot fold them. The summary line that counts them
+    /// stays in the log either way.
+    pub fn detail(&self, body: String) {
+        if let Some(f) = self.file.borrow_mut().as_mut() {
+            let _ = f.write_all(crate::log::scrub(&body).as_bytes());
+            let _ = f.write_all(b"\r\n");
+            btlog!("{}: {}", self.tag, body);
+        }
+    }
 }

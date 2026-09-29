@@ -12,3 +12,7 @@ pub mod text;
 pub mod endpoint;
 #[path = "../../src/wake.rs"]
 pub mod wake;
+#[path = "../../src/dedup.rs"]
+pub mod dedup;
+#[path = "../../src/autostart_cmd.rs"]
+pub mod autostart_cmd;

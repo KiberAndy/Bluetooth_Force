@@ -19,8 +19,15 @@ pub struct SharedState {
     pub device_event: HANDLE,
     /// When the last device-change-driven poll ran (0 = never).
     pub device_wake_last_ms: i64,
+    /// When a device-tree change last cancelled the toggle rate limit.
+    pub device_unpark_last_ms: i64,
     pub device_wakes: u32,
     pub device_wakes_coalesced: u32,
+    /// Device-change wakes rejected as the echo of our own churn.
+    pub device_wakes_self_echo: u32,
+    /// When WE last finished rewriting the device tree (0 = never). Stamped by
+    /// every rung that touches PnP or the radio, not just the connect toggle.
+    pub self_churn_last_ms: i64,
     pub bth: BthApi,
     pub keepalive: SilentKeepalive,
 
@@ -37,8 +44,8 @@ pub struct SharedState {
     pub link_up_since_ms: i64,
     /// When the current down episode started (0 = no episode).
     pub down_since_ms: i64,
-    /// The "replug the dongle by hand" verdict was printed once already.
-    pub hard_wedge_logged: bool,
+    /// When the "link has been down a long time" report was last printed.
+    pub stall_report_ms: i64,
 
     // L6 — paged-pool watchdog.
     pub pool_min_bytes: u64,
@@ -114,8 +121,11 @@ impl SharedState {
             resume_event,
             device_event,
             device_wake_last_ms: 0,
+            device_unpark_last_ms: 0,
             device_wakes: 0,
             device_wakes_coalesced: 0,
+            device_wakes_self_echo: 0,
+            self_churn_last_ms: 0,
             bth,
             keepalive,
             connect_fails: 0,
@@ -130,7 +140,7 @@ impl SharedState {
             connect_inert_logged: false,
             link_up_since_ms: 0,
             down_since_ms: 0,
-            hard_wedge_logged: false,
+            stall_report_ms: 0,
             pool_min_bytes: u64::MAX,
             watchdog_tripped: false,
             watchdog_tripped_ms: 0,

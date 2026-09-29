@@ -22,7 +22,7 @@ use crate::sys::bluetooth::{
 use crate::sys::kernel32::{self, PERFORMANCE_INFORMATION, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use crate::sys::{HANDLE, INVALID_HANDLE_VALUE};
 use crate::util::{now_ms, utf16_field};
-use crate::wake::{device_wake_allowed, poll_wait_ms};
+use crate::wake::{device_wake_allowed, device_wake_may_unpark, is_self_echo, poll_wait_ms};
 
 /// Main worker loop. Runs until `state.running` is cleared.
 pub fn run(state: &mut SharedState) {
@@ -64,12 +64,32 @@ pub fn run(state: &mut SharedState) {
                 }
                 state.device_wake_last_ms = now;
                 state.device_wakes = state.device_wakes.saturating_add(1);
-                if state.link_up_since_ms == 0 {
-                    btlog!(
-                        "device-change wake #{} (coalesced {}) -- polling now instead of waiting out the timer",
-                        state.device_wakes,
-                        state.device_wakes_coalesced
-                    );
+                // The peer may be back. Let the next pass toggle immediately
+                // instead of sitting out a rate limit that can reach 5 min --
+                // but not more often than the unpark floor. Only this case is
+                // logged: the bare wake happened 416 times in the field log
+                // and said nothing that the next line does not.
+                if is_self_echo(now, state.self_churn_last_ms) {
+                    // Our own rung just rewrote the device tree. Cancelling the
+                    // rate limit here is the feedback loop, not a reconnect
+                    // opportunity: the poll still runs, the limit stands.
+                    state.device_wakes_self_echo = state.device_wakes_self_echo.saturating_add(1);
+                } else if device_wake_may_unpark(
+                    now,
+                    state.device_unpark_last_ms,
+                    state.self_churn_last_ms,
+                ) {
+                    state.device_unpark_last_ms = now;
+                    state.connect_toggle_last_ms = 0;
+                    state.next_connect_ms = 0;
+                    if state.link_up_since_ms == 0 {
+                        btlog!(
+                            "device-change wake: the device tree moved and it was not our own churn -- retrying the reconnect now instead of waiting out the rate limit (wakes={}, coalesced={}, own echo={})",
+                            state.device_wakes,
+                            state.device_wakes_coalesced,
+                            state.device_wakes_self_echo
+                        );
+                    }
                 }
             }
             WAIT_TIMEOUT => {}
@@ -319,7 +339,7 @@ fn on_connected(state: &mut SharedState, name: &str) {
         state.r3_last_complete_ms = 0;
         state.flaps_in_episode = 0;
         state.down_since_ms = 0;
-        state.hard_wedge_logged = false;
+        state.stall_report_ms = 0;
         state.peer_absent_streak = 0;
         state.peer_absent_logged = false;
         state.recovery_fails = 0;
@@ -442,6 +462,8 @@ fn on_disconnected(
         }
         if repaired {
             state.connect_fails = 0;
+            // Re-enabling a devnode is our churn as well.
+            state.self_churn_last_ms = now_ms();
             state.next_connect_ms = now_ms() + R2_POST_CYCLE_RECONNECT_MS;
             state.peer_absent_streak = 0;
             state.peer_absent_logged = false;
@@ -474,7 +496,10 @@ fn on_disconnected(
     {
         state.r1_last_reset_ms = now;
         state.r1_reset_in_episode = true;
-        if radio_reset(&state.bth, radio_handle) {
+        let reset_ok = radio_reset(&state.bth, radio_handle);
+        // Page scan went off and back on: the tree moved because WE moved it.
+        state.self_churn_last_ms = now_ms();
+        if reset_ok {
             state.r1_rejects = 0;
             state.connect_fails = 0;
             state.next_connect_ms = now + R1_POST_RESET_RECONNECT_MS;
@@ -498,8 +523,11 @@ fn on_disconnected(
         state.r3_force_after_ms = 0;
         state.r3_last_restart_ms = now;
         state.r3_restarts_in_episode = state.r3_restarts_in_episode.saturating_add(1);
-        if restart_earbud_devnodes(state) {
-            let after = now_ms();
+        let r3_ok = restart_earbud_devnodes(state);
+        let churned = now_ms();
+        state.self_churn_last_ms = churned;
+        if r3_ok {
+            let after = churned;
             state.connect_fails = 0;
             state.next_connect_ms = after + R3_POST_RESTART_RECONNECT_MS;
             state.r3_last_complete_ms = after;
@@ -529,9 +557,12 @@ fn on_disconnected(
         && state.r2_breaker.allow(now)
     {
         state.r2_last_cycle_ms = now;
-        if usb_cycle_radio(state) {
+        let r2_ok = usb_cycle_radio(state);
+        let churned = now_ms();
+        state.self_churn_last_ms = churned;
+        if r2_ok {
             state.connect_fails = 0;
-            let after = now_ms();
+            let after = churned;
             state.next_connect_ms = after + R2_POST_CYCLE_RECONNECT_MS;
             state.r3_force_after_ms = after + R3_POST_CYCLE_DELAY_MS;
             state.r3_restarts_in_episode = 0;
@@ -563,9 +594,12 @@ fn on_disconnected(
         && state.r4_breaker.allow(now)
     {
         state.r4_last_ms = now;
-        if hub_port_cycle_radio(state) {
+        let r4_ok = hub_port_cycle_radio(state);
+        let churned = now_ms();
+        state.self_churn_last_ms = churned;
+        if r4_ok {
             state.connect_fails = 0;
-            let after = now_ms();
+            let after = churned;
             state.next_connect_ms = after + R4_POST_CYCLE_RECONNECT_MS;
             state.r3_force_after_ms = after + R3_POST_CYCLE_DELAY_MS;
             state.r3_restarts_in_episode = 0;
@@ -595,16 +629,24 @@ fn on_disconnected(
     // whether the toggle has to move to its own thread.
     let blocked = now_ms() - started;
     if blocked >= CONNECT_BLOCKING_LOG_MS {
-        btlog!("connect: that pass BLOCKED the poll loop for {blocked} ms (device events are queued, not lost)");
+        // Rounded on purpose: an exact millisecond count would make every one
+        // of these lines unique and defeat the log de-duplication.
+        btlog!(
+            "connect: that pass BLOCKED the poll loop for ~{}.{} s (device events are queued, not lost)",
+            blocked / 1000,
+            (blocked % 1000) / 500 * 5
+        );
     }
     if res.toggled {
-        state.connect_toggle_last_ms = now_ms();
+        let after = now_ms();
+        state.connect_toggle_last_ms = after;
+        state.self_churn_last_ms = after;
         state.connect_toggle_fails = state.connect_toggle_fails.saturating_add(1);
     }
     if res.service_left_disabled {
         btlog!("connect: a profile was left without its driver -- the next poll repays that debt before any escalation");
     }
-    hard_wedge_verdict(state, now);
+    stall_report(state, now);
     match res.outcome {
         ConnectOutcome::Connected => {
             state.connect_fails = 0;
@@ -635,6 +677,7 @@ fn on_disconnected(
             if allow_toggle && state.r3_force_after_ms == 0 {
                 state.r3_force_after_ms = now_ms();
                 state.connect_toggle_last_ms = now_ms();
+                state.self_churn_last_ms = now_ms();
                 state.connect_toggle_fails = state.connect_toggle_fails.saturating_add(1);
             }
             state.next_connect_ms = now + CONNECT_REFUSED_RETRY_MS;
@@ -674,38 +717,40 @@ fn on_disconnected(
     }
 }
 
-/// One-shot honest verdict: every software rung has been spent on this episode
-/// and the link is still down after `HARD_WEDGE_MS`.
+/// Periodic, honest status report for a link that has been down a long time.
 ///
-/// On the VID_0A12&PID_0001 CSR clones this is the expected end state. Their
-/// MCU can latch into a state that only clears when VBUS drops, and no
-/// software path on this box can drop VBUS: `pnputil /restart-device` keeps
-/// the port powered, and both root hubs report ganged power switching, so a
-/// per-port power cycle does not exist. Saying so once beats churning the
-/// stack silently.
-fn hard_wedge_verdict(state: &mut SharedState, now: i64) {
-    if state.hard_wedge_logged || state.down_since_ms == 0 {
+/// This used to print a verdict -- "the adapter is wedged, unplug it". The
+/// field log falsified that: after the report at 22:45 the link came back at
+/// 23:01 through an ordinary profile toggle, with no replug, and the same
+/// happened at 15:23 -> 16:41. `BluetoothSetServiceState` is a LOCAL call; it
+/// cannot tell "the earbuds are in their case" from "the dongle is deaf", so
+/// blaming the dongle was guesswork dressed up as a diagnosis.
+///
+/// What is actually known is reported instead: how long the link has been
+/// down, which rungs ran, and whether the local stack still works (a profile
+/// driver that re-installs cleanly proves it does). The user gets the one
+/// action that is theirs to take, without being told it is certainly needed.
+fn stall_report(state: &mut SharedState, now: i64) {
+    if state.down_since_ms == 0 || now - state.down_since_ms < HARD_WEDGE_MS {
         return;
     }
-    if now - state.down_since_ms < HARD_WEDGE_MS {
+    if state.stall_report_ms != 0 && now - state.stall_report_ms < STALL_REPORT_INTERVAL_MS {
         return;
     }
     // "Spent" = each rung either ran in this episode or is muted for the run.
-    let r1_done = state.r1_reset_in_episode || radio_reset_rung_dead(state.r1_rejects);
-    let r2_done = state.r2_cycled_in_episode || usb_cycle_rung_dead(state.r2_fails);
-    let r3_done = state.r3_restarts_in_episode > 0;
-    let r4_done = hub_port_cycle_rung_dead(state.r4_fails) || state.r4_fails > 0;
-    if !(r1_done && r2_done && r3_done && r4_done) {
-        return;
+    let r1 = state.r1_reset_in_episode || radio_reset_rung_dead(state.r1_rejects);
+    let r2 = state.r2_cycled_in_episode || usb_cycle_rung_dead(state.r2_fails);
+    let r3 = state.r3_restarts_in_episode > 0;
+    let r4 = hub_port_cycle_rung_dead(state.r4_fails) || state.r4_fails > 0;
+    if !(r1 && r2 && r3 && r4) {
+        return; // still climbing the ladder: nothing to report yet
     }
-    state.hard_wedge_logged = true;
+    state.stall_report_ms = now;
     btlog!(
-        "HARD WEDGE: link down for {} s with every software rung spent (page-scan={}, usb-cycle={}, earbud-restart={}, hub-port-cycle={}). This adapter cannot be reset from software: UNPLUG THE DONGLE AND PLUG IT BACK IN. The daemon keeps retrying and will recover on its own the moment the adapter answers again.",
-        (now - state.down_since_ms) / 1000,
-        r1_done,
-        r2_done,
+        "link down for {} min; every software rung has run (page-scan={r1}, usb-cycle={r2}, earbud-restart={}, hub-port-cycle={r4}) and {} reconnect attempt(s) reached the stack without a link. The local stack is healthy: the profile driver re-installs on request. So the peer is not answering -- most often the earbuds are in the case or out of range. If they are out of the case and next to the PC, the adapter is the likely suspect: unplug the dongle and plug it back in. No action is needed otherwise; the daemon reconnects on its own the moment the earbuds answer.",
+        (now - state.down_since_ms) / 60_000,
         state.r3_restarts_in_episode,
-        r4_done
+        state.connect_toggle_fails
     );
 }
 

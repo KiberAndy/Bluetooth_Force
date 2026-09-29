@@ -52,6 +52,10 @@ pub fn run_daemon(target_mac: u64, audio_override: Option<String>) {
         "policy: automatic rungs are radio repair -> native connect (BluetoothSetServiceState) -> page-scan toggle -> earbud-devnode restart -> usb-cycle -> hub port power-cycle. ToothTray is no longer required. The radio is never left un-started, a deliberate user disable is respected, and the usb-cycle and hub-port-cycle rungs mute themselves after two attempts that leave the radio not started / the link down."
     );
 
+    // Autostart is a startup concern, so it is settled here rather than in a
+    // mode the user has to know about.
+    crate::autostart::ensure(&exe, &mac_str, audio_override.as_deref());
+
     // A persistent disable outlives the process that made it, so the very first
     // thing a new run does is account for one.
     if let Some(profile) = crate::connect::debt_profile() {

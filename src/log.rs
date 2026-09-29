@@ -8,11 +8,15 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
 use crate::config;
+use crate::dedup::{Action, Dedup};
 use crate::sys::kernel32;
 use crate::sys::SYSTEMTIME;
 use crate::util;
 
 static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+/// Repeat suppression. Shared by the worker and keepalive threads, so it lives
+/// behind the same kind of lock as the file handle.
+static DEDUP: Mutex<Dedup> = Mutex::new(Dedup::new());
 /// Redaction is on unless `btf_nocensor.txt` sits next to the exe. Cached: the
 /// switch is read once, not on every line.
 static CENSOR: OnceLock<bool> = OnceLock::new();
@@ -64,8 +68,24 @@ fn timestamp() -> String {
 }
 
 /// Emit one already-formatted line.
+///
+/// Repeats are collapsed here, in the single choke point every log line goes
+/// through, so no call site has to remember to rate limit itself.
 pub fn write_line(msg: &str) {
     let msg: &str = &scrub(msg);
+
+    let decision = DEDUP
+        .lock()
+        .map(|mut d| d.decide(msg, util::now_ms()))
+        .unwrap_or(Action::Print);
+    let msg: &str = &match decision {
+        Action::Suppress(_) => return,
+        Action::Print => std::borrow::Cow::Borrowed(msg),
+        Action::PrintWithCount(n, since_ms) => std::borrow::Cow::Owned(format!(
+            "{msg} [+{n} identical line(s) suppressed in the last {} s]",
+            since_ms / 1000
+        )),
+    };
 
     // DebugView / attached debugger channel.
     let dbg = format!("btf: {msg}\0");
