@@ -9,6 +9,9 @@ btf.log
 btf.log.1
 btf_*.txt
 
+# ProcMon captures (large, machine-local)
+Logfile_*.CSV
+
 # Editor / OS noise
 .vscode/
 *.orig

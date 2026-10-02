@@ -16,3 +16,13 @@ pub mod wake;
 pub mod dedup;
 #[path = "../../src/autostart_cmd.rs"]
 pub mod autostart_cmd;
+#[path = "../../src/ladder.rs"]
+pub mod ladder;
+/// Win32 constants `ladder.rs` needs, mirrored so the pure logic runs on Linux.
+pub mod sys {
+    pub mod cfgmgr32 {
+        pub const CM_PROB_DISABLED: u32 = 0x16;
+        pub const DN_HAS_PROBLEM: u32 = 0x400;
+        pub const DN_STARTED: u32 = 0x8;
+    }
+}

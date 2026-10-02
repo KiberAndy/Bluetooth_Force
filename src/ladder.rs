@@ -187,6 +187,39 @@ pub fn usb_cycle_quiet_after_restart(now_ms: i64, last_restart_done_ms: i64) -> 
     now_ms - last_restart_done_ms >= R2_POST_R3_QUIET_MS
 }
 
+/// What a `pnputil /restart-device` run actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartVerdict {
+    /// Exit 0 after a real restart: still needs the DN_STARTED check.
+    Restarted,
+    /// Exit 0 too fast to be a restart (queued behind a pending reboot).
+    NoOp,
+    /// 3010: the dongle refused to stop; restart deferred to reboot.
+    RebootRequired,
+    /// Anything else: fall back to the journalled disable/enable pair.
+    Failed,
+}
+
+/// Classify a pnputil restart. Both `NoOp` and `RebootRequired` mean pnputil
+/// cannot restart this dongle, so the rung is switched off persistently.
+pub fn pnputil_restart_verdict(exit_code: u32, took_ms: i64) -> RestartVerdict {
+    if exit_code == PNPUTIL_REBOOT_REQUIRED {
+        RestartVerdict::RebootRequired
+    } else if exit_code == 0 && took_ms < R2_MIN_REAL_RESTART_MS {
+        RestartVerdict::NoOp
+    } else if exit_code == 0 {
+        RestartVerdict::Restarted
+    } else {
+        RestartVerdict::Failed
+    }
+}
+
+/// One usb-cycle per outage: has this episode (armed at `armed_ms`) not had
+/// its cycle yet?
+pub fn usb_cycle_left_in_episode(last_cycle_ms: i64, armed_ms: i64) -> bool {
+    armed_ms != 0 && last_cycle_ms < armed_ms
+}
+
 /// Is the page-scan rung provably dead on this radio?
 pub fn radio_reset_rung_dead(consecutive_rejects: u32) -> bool {
     consecutive_rejects >= R1_DEAD_REJECTIONS

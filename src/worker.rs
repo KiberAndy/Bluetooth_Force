@@ -182,6 +182,19 @@ fn sample_watchdog(state: &mut SharedState) {
 // Kill switch
 // ---------------------------------------------------------------------------
 
+/// Persistent per-dongle "pnputil cannot restart this" verdict. Checked only
+/// when the rung is otherwise due, so it costs one stat per outage.
+fn usb_cycle_off(state: &mut SharedState) -> bool {
+    if recovery::usb_cycle_off_present() {
+        if !state.r2_dead_logged {
+            state.r2_dead_logged = true;
+            btlog!("rung usb-cycle: OFF for this dongle ({USB_CYCLE_OFF_NAME} is present: pnputil cannot restart it). Delete the file to re-enable.");
+        }
+        return true;
+    }
+    false
+}
+
 /// Cached freeze state, re-read every `FREEZE_RECHECK_MS` so the switch works on
 /// a running daemon without hitting the filesystem on every poll.
 fn escalation_frozen(state: &mut SharedState, now: i64) -> bool {
@@ -547,6 +560,9 @@ fn on_disconnected(
         }
     } else if !escalation_frozen(state, now)
         && !peer_absent_freeze(state.peer_absent_streak)
+        // One usb-cycle per outage. The field log showed 69 cycles in one
+        // afternoon while the earbuds were simply not answering.
+        && usb_cycle_left_in_episode(state.r2_last_cycle_ms, state.r1_armed_ms)
         && should_usb_cycle(
             state.r1_armed_ms,
             now,
@@ -555,6 +571,7 @@ fn on_disconnected(
         )
         && usb_cycle_quiet_after_restart(now, state.r3_last_complete_ms)
         && state.r2_breaker.allow(now)
+        && !usb_cycle_off(state)
     {
         state.r2_last_cycle_ms = now;
         let r2_ok = usb_cycle_radio(state);
@@ -739,9 +756,17 @@ fn stall_report(state: &mut SharedState, now: i64) {
     }
     // "Spent" = each rung either ran in this episode or is muted for the run.
     let r1 = state.r1_reset_in_episode || radio_reset_rung_dead(state.r1_rejects);
-    let r2 = state.r2_cycled_in_episode || usb_cycle_rung_dead(state.r2_fails);
+    // usb-cycle is spent once it was tried this outage or is off/muted.
+    let r2 = state.r2_cycled_in_episode
+        || usb_cycle_rung_dead(state.r2_fails)
+        || state.r2_dead_logged
+        || !usb_cycle_left_in_episode(state.r2_last_cycle_ms, state.r1_armed_ms);
     let r3 = state.r3_restarts_in_episode > 0;
-    let r4 = hub_port_cycle_rung_dead(state.r4_fails) || state.r4_fails > 0;
+    // hub-port-cycle only runs after a verified usb-cycle; without one it can
+    // never run, so it must not hold the report back forever.
+    let r4 = hub_port_cycle_rung_dead(state.r4_fails)
+        || state.r4_fails > 0
+        || !state.r2_cycled_in_episode;
     if !(r1 && r2 && r3 && r4) {
         return; // still climbing the ladder: nothing to report yet
     }

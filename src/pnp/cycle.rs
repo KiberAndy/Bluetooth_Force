@@ -89,19 +89,39 @@ pub fn cycle_csr_radio_once(out: &HealthOut) -> bool {
     // so if it works the radio cannot be stranded by a crash.
     if let Some(pnputil) = crate::util::system_path_of("pnputil.exe") {
         let cmd = format!("\"{pnputil}\" /restart-device \"{}\"", id.as_str());
+        let t0 = crate::util::now_ms();
         if let Some(code) = run_hidden_wait(&cmd, PNPUTIL_TIMEOUT_MS) {
-            if code == 0 && wait_devnode_started(target.DevInst, R2_ENABLE_VERIFY_MS) {
-                recovery::journal_disarm();
-                out.line("complete (1 cycled via pnputil /restart-device, no persistent disable needed)");
-                return true;
-            }
-            if code == PNPUTIL_REBOOT_REQUIRED {
-                out.line(
-                    "pnputil /restart-device returned 3010 (REBOOT REQUIRED) -- the radio is STOPPED. \
-Not disabling anything; the repair rung takes over and keeps retrying. If it never comes back, \
-reboot Windows or run: bluetooth_force.exe --recover",
-                );
-                return false; // journal deliberately LEFT ARMED
+            let took = crate::util::now_ms() - t0;
+            match crate::ladder::pnputil_restart_verdict(code, took) {
+                crate::ladder::RestartVerdict::Restarted => {
+                    if wait_devnode_started(target.DevInst, R2_ENABLE_VERIFY_MS) {
+                        recovery::journal_disarm();
+                        out.line("complete (1 cycled via pnputil /restart-device, no persistent disable needed)");
+                        return true;
+                    }
+                }
+                crate::ladder::RestartVerdict::NoOp => {
+                    // Field log: after one 3010, every later call "succeeded"
+                    // in ~20 ms without restarting anything.
+                    if devnode_started(target.DevInst) {
+                        recovery::journal_disarm();
+                    }
+                    recovery::usb_cycle_off_write("pnputil exit 0 without restarting (restart pending from an earlier 3010)");
+                    out.line_fmt(format!(
+                        "pnputil /restart-device returned 0 in {took} ms WITHOUT restarting (a restart is still pending from an earlier 3010) -- usb-cycle is now OFF for this dongle ({USB_CYCLE_OFF_NAME})"
+                    ));
+                    return false;
+                }
+                crate::ladder::RestartVerdict::RebootRequired => {
+                    recovery::usb_cycle_off_write("pnputil /restart-device returned 3010");
+                    out.line_fmt(format!(
+                        "pnputil /restart-device returned 3010 (REBOOT REQUIRED): the dongle refused to stop and Windows queued the restart for the next reboot. \
+This leaves the CSR dongle half-stopped, so usb-cycle is now OFF for this dongle ({USB_CYCLE_OFF_NAME}). \
+The repair rung checks the radio. If Bluetooth stays dead, replug the dongle or reboot."
+                    ));
+                    return false; // journal LEFT ARMED: the repair rung verifies the radio
+                }
+                crate::ladder::RestartVerdict::Failed => {}
             }
             out.line_fmt(format!(
                 "pnputil /restart-device did not verify (exit={code}) -- falling back to the journalled disable/enable pair"

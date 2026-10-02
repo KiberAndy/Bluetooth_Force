@@ -64,6 +64,21 @@ pub fn freeze_present() -> bool {
     util::self_dir_path("btf_freeze.txt").is_some_and(|p| p.exists())
 }
 
+/// Is the persistent "usb-cycle does not work on this dongle" marker present?
+pub fn usb_cycle_off_present() -> bool {
+    util::self_dir_path(USB_CYCLE_OFF_NAME).is_some_and(|p| p.exists())
+}
+
+/// Persist the verdict that pnputil cannot restart this dongle.
+pub fn usb_cycle_off_write(reason: &str) {
+    if let Some(path) = util::self_dir_path(USB_CYCLE_OFF_NAME) {
+        let _ = std::fs::write(
+            path,
+            format!("usb-cycle disabled: {reason}\r\nDelete this file to re-enable it.\r\n"),
+        );
+    }
+}
+
 /// Rung 0: re-enable every present CSR radio devnode that is sitting disabled
 /// or otherwise not started.
 ///

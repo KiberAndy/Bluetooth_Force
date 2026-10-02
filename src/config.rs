@@ -138,6 +138,13 @@ pub const R2_REENUM_POLL_MS: u32 = 250;
 pub const R2_POST_CYCLE_RECONNECT_MS: i64 = 2_000;
 /// After this many attempts that left the radio not started, mute the rung.
 pub const R2_DEAD_FAILURES: u32 = 2;
+/// Marker next to the exe: this dongle cannot be restarted by pnputil (it
+/// answered 3010 or a no-op). Persisted so every logon does not re-wedge it.
+/// Delete the file to re-enable the usb-cycle rung.
+pub const USB_CYCLE_OFF_NAME: &str = "btf_no_usb_cycle.txt";
+/// A real CSR restart takes seconds. pnputil exit 0 faster than this means the
+/// restart was queued behind a pending reboot, i.e. nothing happened.
+pub const R2_MIN_REAL_RESTART_MS: i64 = 1_000;
 pub const PNPUTIL_TIMEOUT_MS: u32 = 30_000;
 pub const PNPUTIL_REBOOT_REQUIRED: u32 = 3010;
 /// The dongle this build cycles: CSR-based BT radio.
