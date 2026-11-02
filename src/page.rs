@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::btlog;
 use crate::config::*;
 use crate::mac::format_mac;
-use crate::page_fsm::{classify_socket_error, PageOutcome};
+use crate::page_fsm::{classify_socket_error, holds_socket, PageOutcome};
 use crate::sys::GUID;
 use crate::sys::ws2_32 as w;
 
@@ -152,9 +152,11 @@ unsafe fn connect_one(
         }
     };
     match out {
-        // The page went out: the socket stays open ONLY when the caller
-        // holds it for the episode; the probe and failed paths close.
-        (PageOutcome::Attempted, _, _, _) if keep => (PageOutcome::Attempted, 0, "", Some(s)),
+        // The page went out: the socket stays open ONLY when the caller holds
+        // it for the episode, and only a really connected socket is worth
+        // holding -- a refusal is contact but leaves a dead socket (see
+        // `holds_socket`). The probe and failed paths close.
+        (o, e, _, _) if keep && holds_socket(o, e) => (PageOutcome::Attempted, 0, "", Some(s)),
         (o, e, st, _) => {
             unsafe { w::closesocket(s) };
             (o, e, st, None)
@@ -225,12 +227,20 @@ unsafe fn page_connected(addr: u64) -> (PageOutcome, i32, &'static str, Option<u
     unsafe { connect_one(w::BTHPROTO_RFCOMM, &via_sdp, "connect-rfcomm", true) }
 }
 
-/// The connect is in flight: wait writable up to the timeout, then read the
-/// real verdict via `SO_ERROR` (a writable socket may still be a refusal).
+/// The connect is in flight: wait up to the timeout, then read the real
+/// verdict via `SO_ERROR` (a writable socket may still be a refusal).
 /// Never returns an open socket (4th element always `None`): keeping is
 /// decided by `connect_one`, not here.
+///
+/// Windows reports a FAILED non-blocking connect in `exceptfds`, not in
+/// `writefds` (`select` docs). Watching only `writefds` hid every failure:
+/// `select` sat out the full timeout and the refusal was logged as silence.
 unsafe fn wait_writable(s: usize) -> (PageOutcome, i32, &'static str, Option<usize>) {
     let mut wfds = w::FD_SET {
+        fd_count: 1,
+        fd_array: [s; 64],
+    };
+    let mut efds = w::FD_SET {
         fd_count: 1,
         fd_array: [s; 64],
     };
@@ -243,7 +253,7 @@ unsafe fn wait_writable(s: usize) -> (PageOutcome, i32, &'static str, Option<usi
             0,
             core::ptr::null_mut(),
             &mut wfds,
-            core::ptr::null_mut(),
+            &mut efds,
             &tv,
         )
     };
@@ -254,7 +264,13 @@ unsafe fn wait_writable(s: usize) -> (PageOutcome, i32, &'static str, Option<usi
             let err = unsafe { w::WSAGetLastError() };
             return (PageOutcome::Failed, err, "getsockopt(SO_ERROR)", None);
         }
-        let (outcome, code) = (classify_socket_error(so_err), so_err);
+        // In `exceptfds` with `SO_ERROR == 0` must not be success (no code
+        // to name what failed): report it as a failure, never as a page.
+        let (outcome, code) = if efds.fd_count > 0 && so_err == 0 {
+            (PageOutcome::Failed, -1)
+        } else {
+            (classify_socket_error(so_err), so_err)
+        };
         (outcome, code, "SO_ERROR", None)
     } else if n == 0 {
         // Timeout: the page went out and nobody answered.

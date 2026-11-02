@@ -55,6 +55,14 @@ pub fn classify_socket_error(code: i32) -> PageOutcome {
     }
 }
 
+/// Whether the socket may be held for the episode. A refusal is contact
+/// (`Attempted`) but the socket is dead -- holding it would put a corpse in
+/// `held_page_socket` and make the "at least one DLC stays open" invariant
+/// a lie.
+pub fn holds_socket(outcome: PageOutcome, code: i32) -> bool {
+    outcome == PageOutcome::Attempted && code == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +94,17 @@ mod tests {
             classify_socket_error(w::WSAECONNREFUSED),
             PageOutcome::Attempted
         );
+    }
+
+    #[test]
+    fn refusal_is_contact_but_not_a_hold() {
+        assert!(holds_socket(PageOutcome::Attempted, 0));
+        assert!(!holds_socket(
+            PageOutcome::Attempted,
+            w::WSAECONNREFUSED
+        ));
+        assert!(!holds_socket(PageOutcome::Unreachable, 0));
+        assert!(!holds_socket(PageOutcome::Failed, 0));
     }
 
     #[test]

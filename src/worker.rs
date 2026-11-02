@@ -563,7 +563,10 @@ fn on_disconnected(
                 // The page went out: the new socket replaces the old hold
                 // (at least one DLC stays open at all times -- WE never
                 // drop the ACL ourselves). The old one, if any, is closed
-                // only AFTER the fresh page exists.
+                // only AFTER the fresh page exists. A refusal arrives here
+                // with no socket (`held == None`): the peer answered, so the
+                // stack still gets its settle window, but a dead socket is
+                // never stored.
                 if let Some(new) = held {
                     if let Some(old) = take_held_page(state) {
                         page::close_held(old);
