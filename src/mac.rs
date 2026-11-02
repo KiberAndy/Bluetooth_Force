@@ -34,13 +34,32 @@ fn hex_nibble(c: u8) -> Result<u8, MacError> {
     }
 }
 
-/// Parse `AA:BB:CC:DD:EE:FF` into the raw 48-bit address.
+/// Parse `AA:BB:CC:DD:EE:FF` (also `AA-BB-...` or plain `AABBCCDDEEFF`)
+/// into the raw 48-bit address.
 pub fn parse_mac(s: &str) -> Result<u64, MacError> {
+    // Plain 12-hex without separators (instance-ID shape, either case).
+    if s.len() == 12 && s.bytes().all(|c| c.is_ascii_hexdigit()) {
+        let mut mac: u64 = 0;
+        for chunk in s.as_bytes().chunks(2) {
+            let hi = hex_nibble(chunk[0])?;
+            let lo = hex_nibble(chunk[1])?;
+            mac = (mac << 8) | ((hi as u64) << 4) | (lo as u64);
+        }
+        if mac == 0 {
+            return Err(MacError::Zero);
+        }
+        return Ok(mac);
+    }
     let b = s.as_bytes();
     if b.len() != 17 {
         return Err(MacError::InvalidFormat);
     }
-    if b[2] != b':' || b[5] != b':' || b[8] != b':' || b[11] != b':' || b[14] != b':' {
+    if (b[2] != b':' && b[2] != b'-')
+        || (b[5] != b':' && b[5] != b'-')
+        || (b[8] != b':' && b[8] != b'-')
+        || (b[11] != b':' && b[11] != b'-')
+        || (b[14] != b':' && b[14] != b'-')
+    {
         return Err(MacError::InvalidFormat);
     }
     let mut mac: u64 = 0;
@@ -119,11 +138,14 @@ mod tests {
         assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF").unwrap(), 0xAABBCCDDEEFF);
         assert_eq!(parse_mac("aA:bB:cC:dD:eE:fF").unwrap(), 0xAABBCCDDEEFF);
         assert_eq!(parse_mac("12:34:56:78:9A:BC").unwrap(), 0x123456789ABC);
+        assert_eq!(parse_mac("AA-BB-CC-DD-EE-FF").unwrap(), 0xAABBCCDDEEFF);
+        assert_eq!(parse_mac("AABBCCDDEEFF").unwrap(), 0xAABBCCDDEEFF);
+        assert_eq!(parse_mac("948B93B1E4A1").unwrap(), 0x948B93B1E4A1);
     }
 
     #[test]
     fn parse_invalid() {
-        for bad in ["", "AA:BB:CC:DD:EE", "AA-BB-CC-DD-EE-FF", "AABBCCDDEEFF", " AA:BB:CC:DD:EE:FF"] {
+        for bad in ["", "AA:BB:CC:DD:EE", " AA:BB:CC:DD:EE:FF", "AABBCCDDEEF", "AABBCCDDEEFF0"] {
             assert_eq!(parse_mac(bad), Err(MacError::InvalidFormat));
         }
         assert_eq!(parse_mac("XX:BB:CC:DD:EE:FF"), Err(MacError::InvalidHex));

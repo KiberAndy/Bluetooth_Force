@@ -23,6 +23,8 @@ mod log;
 mod mac;
 mod modes;
 mod output;
+mod page;
+mod page_fsm;
 mod pnp;
 mod redact;
 mod state;
@@ -63,6 +65,10 @@ fn main() {
         }
         "--probe-hubs" => {
             modes::probe_hubs::run(&args[2..]);
+            return;
+        }
+        "--page-probe" => {
+            modes::page_probe::run(&args[2..]);
             return;
         }
         _ => {}

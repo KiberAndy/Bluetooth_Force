@@ -17,6 +17,7 @@ pub mod setupapi;
 pub mod shell32;
 pub mod user32;
 pub mod winmm;
+pub mod ws2_32;
 
 pub type HANDLE = *mut c_void;
 pub type HMODULE = *mut c_void;

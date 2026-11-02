@@ -403,8 +403,12 @@ mod tests {
             } else {
                 self.enabled[i] = enable;
                 if enable {
-                    // "Enabling a service installs the corresponding device
-                    // driver": a fresh install pages the peer.
+                    // TEST-MODEL assumption for the legacy toggle path, NOT
+                    // field behavior: the ETW capture
+                    // (docs/manual_connect_path.md) proved a plain ENABLE
+                    // emits zero HCI -- nothing pages the peer. The real page
+                    // now comes from page.rs; this model only exercises the
+                    // toggle's driver bookkeeping.
                     if !self.in_case {
                         self.link_up = true;
                     }

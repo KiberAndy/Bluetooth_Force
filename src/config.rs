@@ -55,6 +55,29 @@ pub const CONNECT_BACKOFF_CAP_MS: u32 = 4_000;
 /// A refusal ("service already enabled") touched nothing and reached nobody, so
 /// it is retried on the next poll instead of feeding the exponential backoff.
 pub const CONNECT_REFUSED_RETRY_MS: i64 = 1_000;
+// ---------------------------------------------------------------------------
+// Page-first: outgoing RFCOMM page (docs/manual_connect_path.md)
+// ---------------------------------------------------------------------------
+
+/// L2CAP PSM used by the `--page-probe` tripwire only: AVDTP (`0x19`), the
+/// channel the manual "Подключить" burst opens (ETW 17:42:28). NOT SDP
+/// (`0x01`): that PSM is reserved by Windows' own internal SDP client. The
+/// daemon does not use it -- the stack refuses every L2CAP client connect
+/// synchronously with 10050 (no page goes out), so the daemon pages over
+/// RFCOMM instead. Kept so a future stack change shows up as a probe change.
+pub const PAGE_PSM: u32 = 0x0019;
+/// A fresh outage gets this long before the first page: the stack may still
+/// be settling, or the peer blinking.
+pub const PAGE_MIN_DOWN_MS: i64 = 10_000;
+/// Repeat cadence while the link stays down. A page that went out needs no
+/// hurry: either the burst connects, or the ladder repairs the radio.
+pub const PAGE_CADENCE_MS: i64 = 60_000;
+/// Hard bound of one page attempt: non-blocking socket + `select`.
+pub const PAGE_CONNECT_TIMEOUT_MS: u32 = 5_000;
+/// After a page went out, the stack gets this long to run the profile burst
+/// (SDP/AVDTP/AVCTP, ~1.4 s in the capture) before the next pass looks.
+pub const PAGE_SETTLE_MS: i64 = 3_000;
+
 /// The reconnect toggle removes and re-installs a profile driver, so it is rate
 /// limited: this is the shortest gap between two toggles.
 pub const CONNECT_TOGGLE_MIN_INTERVAL_MS: i64 = 15_000;

@@ -2,6 +2,7 @@
 //! keepalive when connected, and drives the recovery ladder when not.
 
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bluetooth::{default_search_params, empty_device_info, BthApi};
 use crate::btlog;
@@ -10,6 +11,8 @@ use crate::connect::{self, ConnectOutcome};
 use crate::connect_fsm::{should_toggle, E_INVALIDARG, ERROR_INVALID_PARAMETER};
 use crate::ladder::*;
 use crate::output::HealthOut;
+use crate::page::{self, PageResult};
+use crate::page_fsm::should_page;
 use crate::pnp::cycle::usb_cycle_radio;
 use crate::pnp::devnode::is_user_admin;
 use crate::pnp::hub::hub_port_cycle_radio;
@@ -49,6 +52,13 @@ pub fn run(state: &mut SharedState) {
                 // first post-wake connect wait out the toggle rate limit.
                 state.connect_toggle_last_ms = 0;
                 state.connect_toggle_fails = 0;
+                state.page_last_ms = 0;
+                state.page_fails = 0;
+                // Sockets do not survive sleep: drop the hold so the next
+                // page opens fresh instead of guarding a dead handle.
+                if let Some(s) = take_held_page(state) {
+                    page::close_held(s);
+                }
             }
             w if w == WAIT_OBJECT_0 + 1 => {
                 if !state.is_running() {
@@ -82,6 +92,7 @@ pub fn run(state: &mut SharedState) {
                     state.device_unpark_last_ms = now;
                     state.connect_toggle_last_ms = 0;
                     state.next_connect_ms = 0;
+                    state.page_last_ms = 0;
                     if state.link_up_since_ms == 0 {
                         btlog!(
                             "device-change wake: the device tree moved and it was not our own churn -- retrying the reconnect now instead of waiting out the rate limit (wakes={}, coalesced={}, own echo={})",
@@ -303,8 +314,40 @@ fn perform_poll(state: &mut SharedState, _poll_count: u32) {
     }
 }
 
+fn st_to_sec(st: &crate::sys::SYSTEMTIME) -> u64 {
+    ((st.wDay as u64 * 24 + st.wHour as u64) * 60 + st.wMinute as u64) * 60 + st.wSecond as u64
+}
+
+static PEER_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+static PEER_USED: AtomicU64 = AtomicU64::new(u64::MAX);
+static PEER_CONN: AtomicU64 = AtomicU64::new(u64::MAX);
+
 fn handle_found(state: &mut SharedState, radio_handle: HANDLE, device_info: &BLUETOOTH_DEVICE_INFO) {
     let name = utf16_field(&device_info.szName);
+
+    // DIAGNOSTIC (temporary): independent case-open witness. Every poll
+    // compares the peer's connected flag + LastSeen/LastUsed against the
+    // previous poll and logs on ANY change. A case open powers the peer:
+    // the radio seeing it bumps LastSeen even before a link exists, so the
+    // transition timestamp in the log IS the moment -- no user timing needed.
+    let seen = st_to_sec(&device_info.stLastSeen);
+    let used = st_to_sec(&device_info.stLastUsed);
+    let conn = device_info.fConnected as u64;
+    let prev_seen = PEER_SEEN.swap(seen, Ordering::Relaxed);
+    let prev_used = PEER_USED.swap(used, Ordering::Relaxed);
+    let prev_conn = PEER_CONN.swap(conn, Ordering::Relaxed);
+    if seen != prev_seen || used != prev_used || conn != prev_conn {
+        btlog!(
+            "peer-probe: connected={} lastseen={:02}:{:02}:{:02} lastused={:02}:{:02}:{:02}",
+            device_info.fConnected,
+            device_info.stLastSeen.wHour,
+            device_info.stLastSeen.wMinute,
+            device_info.stLastSeen.wSecond,
+            device_info.stLastUsed.wHour,
+            device_info.stLastUsed.wMinute,
+            device_info.stLastUsed.wSecond
+        );
+    }
 
     // Route through the pure decision function so tested logic and production
     // logic cannot drift.
@@ -353,6 +396,13 @@ fn on_connected(state: &mut SharedState, name: &str) {
         state.flaps_in_episode = 0;
         state.down_since_ms = 0;
         state.stall_report_ms = 0;
+        state.page_last_ms = 0;
+        state.page_fails = 0;
+        // The link is stable and Windows holds it: our DLC is redundant,
+        // release it so no stale socket outlives the episode.
+        if let Some(s) = take_held_page(state) {
+            page::close_held(s);
+        }
         state.peer_absent_streak = 0;
         state.peer_absent_logged = false;
         state.recovery_fails = 0;
@@ -368,6 +418,18 @@ fn on_connected(state: &mut SharedState, name: &str) {
 
     if !state.watchdog_tripped {
         state.keepalive.start(name);
+    }
+}
+
+/// Take the held page socket out of the state (`None` = no hold).
+/// `u64::MAX` is the sentinel -- a real SOCKET value never reaches it.
+fn take_held_page(state: &mut SharedState) -> Option<usize> {
+    if state.held_page_socket == u64::MAX {
+        None
+    } else {
+        let s = state.held_page_socket as usize;
+        state.held_page_socket = u64::MAX;
+        Some(s)
     }
 }
 
@@ -485,6 +547,41 @@ fn on_disconnected(
     }
     if recovery_blocks_escalation(state.recovery_armed) {
         return;
+    }
+
+    // PAGE-FIRST: an outgoing page is the only action ever observed to put
+    // bytes on the air toward the peer (docs/manual_connect_path.md). It is an
+    // RFCOMM connect (the field probe proved L2CAP is refused pre-page). It
+    // runs on its own clock -- independent of the toggle rate limit -- after
+    // rung 0 (the radio must be healthy) and before R1 (no reason to reset a
+    // radio that has not paged yet). A page emits no device-tree churn, so the
+    // self-echo guard is deliberately NOT stamped here.
+    if should_page(now, state.down_since_ms, state.page_last_ms) {
+        state.page_last_ms = now_ms();
+        match page::page_hold(state.target_mac) {
+            (PageResult::Attempted, held) => {
+                // The page went out: the new socket replaces the old hold
+                // (at least one DLC stays open at all times -- WE never
+                // drop the ACL ourselves). The old one, if any, is closed
+                // only AFTER the fresh page exists.
+                if let Some(new) = held {
+                    if let Some(old) = take_held_page(state) {
+                        page::close_held(old);
+                    }
+                    state.held_page_socket = new as u64;
+                }
+                state.page_fails = 0;
+                state.next_connect_ms = now_ms() + PAGE_SETTLE_MS;
+                return;
+            }
+            (PageResult::Unreachable, _) | (PageResult::Failed, _) => {
+                state.page_fails = state.page_fails.saturating_add(1);
+                // Fall through to the ladder: either the peer never answered
+                // (Unreachable) or Winsock itself is sick (Failed) -- the
+                // rungs may repair what the page could not reach. A previous
+                // hold, if any, stays open: it may still be guarding the ACL.
+            }
+        }
     }
 
     // R1 — page-scan toggle.
