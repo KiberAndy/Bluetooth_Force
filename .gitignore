@@ -1,5 +1,9 @@
 # Rust build output
 /target/
+/poc/target/
+
+# Local engineering state, diagnostics, builds and executable backups
+/.sharrowkin/
 
 # MSVC link artifacts next to the binary
 *.pdb

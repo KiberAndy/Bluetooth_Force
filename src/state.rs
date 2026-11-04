@@ -42,8 +42,11 @@ pub struct SharedState {
     pub connect_inert_logged: bool,
     // Page-first: outgoing RFCOMM page clock. Independent of the toggle rate
     // limit: a page emits no device-tree churn, so it needs no echo guard.
+    pub audio_connect_last_ms: i64,
+    pub audio_connect_accepted: bool,
     pub page_last_ms: i64,
     pub page_fails: u32,
+    pub page_settle_until_ms: i64,
     /// The RFCOMM socket a successful page keeps open (`u64::MAX` = none).
     /// Holding it keeps the ACL alive: the field ETW proved that closing
     /// the last DLC makes the host itself emit `HCI_Disconnect`. Closed on
@@ -148,8 +151,11 @@ impl SharedState {
             connect_toggle_last_ms: 0,
             connect_toggle_fails: 0,
             connect_inert_logged: false,
+            audio_connect_last_ms: 0,
+            audio_connect_accepted: false,
             page_last_ms: 0,
             page_fails: 0,
+            page_settle_until_ms: 0,
             held_page_socket: u64::MAX,
             link_up_since_ms: 0,
             down_since_ms: 0,

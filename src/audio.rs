@@ -43,6 +43,8 @@ struct KeepaliveInner {
     want_run: AtomicBool,
     /// Resolved fresh before every session; only kept for diagnostics.
     device_id: AtomicU32,
+    /// True only while a buffer is queued to the matched earbud endpoint.
+    target_streaming: AtomicBool,
     /// Bluetooth name the endpoint is matched against, plus the user override.
     bt_name: Mutex<String>,
     override_name: Option<String>,
@@ -66,6 +68,7 @@ impl SilentKeepalive {
             inner: Arc::new(KeepaliveInner {
                 want_run: AtomicBool::new(false),
                 device_id: AtomicU32::new(WAVE_MAPPER),
+                target_streaming: AtomicBool::new(false),
                 bt_name: Mutex::new(String::new()),
                 override_name,
                 consec_fails: AtomicU32::new(0),
@@ -87,6 +90,10 @@ impl SilentKeepalive {
 
     pub fn is_running(&self) -> bool {
         self.thread.is_some()
+    }
+
+    pub fn target_streaming(&self) -> bool {
+        self.inner.target_streaming.load(Ordering::Acquire)
     }
 
     /// Resolve the endpoint and start the worker if one is not already live.
@@ -134,6 +141,7 @@ fn resolve_endpoint(inner: &KeepaliveInner) -> (u32, u32) {
 
     let mut names: Vec<String> = Vec::new();
     let mut formats: Vec<u32> = Vec::new();
+    let mut ids: Vec<u32> = Vec::new();
     for dev in 0..n {
         let mut caps = WAVEOUTCAPSW::default();
         let rc = unsafe {
@@ -144,23 +152,24 @@ fn resolve_endpoint(inner: &KeepaliveInner) -> (u32, u32) {
         }
         names.push(util::utf16_field(&caps.szPname));
         formats.push(caps.dwFormats);
+        ids.push(dev);
     }
 
     let bt_name = inner.bt_name.lock().map(|n| n.clone()).unwrap_or_default();
     match select_audio_device(&names, &bt_name, inner.override_name.as_deref()) {
         Some(idx) => {
             let previous = inner.device_id.load(Ordering::Acquire);
-            if previous != idx as u32 {
+            if previous != ids[idx] {
                 btlog!(
                     "keepalive -> endpoint #{idx} ({}) dwFormats=0x{:x}",
                     names[idx],
                     formats[idx]
                 );
             }
-            (idx as u32, formats[idx])
+            (ids[idx], formats[idx])
         }
         None => {
-            btlog!("keepalive -> WAVE_MAPPER (no earbud endpoint matched among {} device(s))", names.len());
+            btlog!("keepalive: target endpoint missing among {} device(s) -- waiting, not streaming to WAVE_MAPPER", names.len());
             (WAVE_MAPPER, 0)
         }
     }
@@ -187,10 +196,8 @@ fn run(inner: Arc<KeepaliveInner>) {
         let (device_id, dw_formats) = resolve_endpoint(&inner);
         inner.device_id.store(device_id, Ordering::Release);
 
-        // A WAVE_MAPPER session is a FALLBACK, not a destination: it streams
-        // to the default device, which may not be the earbuds at all. Give it
-        // a deadline so the endpoint list is re-read once the reconnect has
-        // finished publishing the earbud endpoint.
+        // Missing endpoint: re-enumerate soon, with a bounded probe cadence.
+        // Never open WAVE_MAPPER: the default may be the monitor or speakers.
         let probe_ms = if device_id == WAVE_MAPPER {
             let ms = probe_wait_ms(unmatched);
             unmatched = unmatched.saturating_add(1);
@@ -199,6 +206,13 @@ fn run(inner: Arc<KeepaliveInner>) {
             unmatched = 0;
             0
         };
+        // A missing endpoint is not a successful keepalive on the default
+        // speakers. Keep probing without opening an unrelated output.
+        if device_id == WAVE_MAPPER {
+            inner.target_streaming.store(false, Ordering::Release);
+            interruptible_sleep(&inner, probe_ms);
+            continue;
+        }
         let opened = run_session(&inner, device_id, dw_formats, probe_ms);
         if opened {
             fails = 0;
@@ -241,14 +255,16 @@ fn wave_format(spec: WaveFormatSpec) -> WAVEFORMATEX {
 }
 
 /// Keeps the driver from referencing our stack header / buffer on unwind.
-struct SessionGuard {
+struct SessionGuard<'a> {
+    streaming: &'a AtomicBool,
     hwo: HANDLE,
     hdr: *mut WAVEHDR,
     queued: bool,
 }
 
-impl Drop for SessionGuard {
+impl Drop for SessionGuard<'_> {
     fn drop(&mut self) {
+        self.streaming.store(false, Ordering::Release);
         unsafe {
             waveOutReset(self.hwo);
             if self.queued {
@@ -327,7 +343,9 @@ fn run_session(
         return false;
     }
 
-    let mut guard = SessionGuard { hwo, hdr: hdr_ptr, queued: false };
+    let mut guard = SessionGuard {
+        streaming: &inner.target_streaming, hwo, hdr: hdr_ptr, queued: false,
+    };
 
     let rc = unsafe { waveOutWrite(hwo, hdr_ptr, std::mem::size_of::<WAVEHDR>() as u32) };
     if rc != 0 {
@@ -335,6 +353,7 @@ fn run_session(
         return false;
     }
     guard.queued = true;
+    inner.target_streaming.store(true, Ordering::Release);
 
     // The looping buffer plays for years; idle until stop is requested. If the
     // loop ever does finish, re-arm it once.
@@ -405,6 +424,7 @@ mod tests {
     fn fresh_instance_idle() {
         let ka = SilentKeepalive::new(None);
         assert!(!ka.is_running());
+        assert!(!ka.target_streaming());
         assert_eq!(ka.consec_fails(), 0);
         assert_eq!(ka.inner.device_id.load(Ordering::Acquire), WAVE_MAPPER);
     }

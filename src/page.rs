@@ -69,9 +69,13 @@ pub fn page_hold(addr: u64) -> (PageResult, Option<usize>) {
     }
     let (out, err, stage, held) = unsafe { page_connected(addr) };
     match out {
-        PageOutcome::Attempted => btlog!(
+        PageOutcome::Attempted if held.is_some() => btlog!(
             "page: outgoing RFCOMM page to Hands-Free on {} -- holding the socket open for the episode (closing it drops the ACL, field ETW 18:49)",
             format_mac(addr),
+        ),
+        PageOutcome::Attempted => btlog!(
+            "page: peer {} answered but refused RFCOMM (error {}) -- no live socket to hold; allowing profile settle",
+            format_mac(addr), err
         ),
         PageOutcome::Unreachable => btlog!(
             "page: {} did not answer the page -- falling through to the ladder",

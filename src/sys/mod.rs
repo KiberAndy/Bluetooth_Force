@@ -11,6 +11,7 @@
 use std::ffi::c_void;
 
 pub mod bluetooth;
+pub mod core_audio;
 pub mod cfgmgr32;
 pub mod kernel32;
 pub mod setupapi;

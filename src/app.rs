@@ -44,12 +44,12 @@ pub fn run_daemon(target_mac: u64, audio_override: Option<String>) {
     crate::log::init();
     let exe = util::module_file_name().unwrap_or_else(|| "?".to_string());
     btlog!(
-        "start: build=rust3.0 mac={mac_str} exe={exe} admin={} log={}",
+        "start: build=rust3.0-a2dp-reconnect mac={mac_str} exe={exe} admin={} log={}",
         is_user_admin(),
         if crate::log::is_active() { config::LOG_NAME } else { "NONE (file log unavailable)" }
     );
     btlog!(
-        "policy: automatic rungs are radio repair -> native connect (BluetoothSetServiceState) -> page-scan toggle -> earbud-devnode restart -> usb-cycle -> hub port power-cycle. ToothTray is no longer required. The radio is never left un-started, a deliberate user disable is respected, and the usb-cycle and hub-port-cycle rungs mute themselves after two attempts that leave the radio not started / the link down."
+        "policy: radio repair -> native A2DP ONESHOT_RECONNECT -> RFCOMM/driver recovery only when native audio reconnect is unavailable. Bluetooth transport alone is not success: target audio must be streaming. ToothTray is no longer required. The radio is never left un-started, a deliberate user disable is respected, and the usb-cycle and hub-port-cycle rungs mute themselves after two attempts that leave the radio not started / the link down."
     );
 
     // Autostart is a startup concern, so it is settled here rather than in a

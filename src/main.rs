@@ -10,6 +10,7 @@
 
 mod app;
 mod audio;
+mod audio_connect;
 mod autostart;
 mod autostart_cmd;
 mod bluetooth;

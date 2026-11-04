@@ -41,7 +41,7 @@ pub const DEDUP_SLOTS: usize = 32;
 /// First re-check of the endpoint list after a WAVE_MAPPER fallback.
 pub const ENDPOINT_PROBE_BASE_MS: u32 = 1_000;
 /// Cap for that re-check interval.
-pub const ENDPOINT_PROBE_CAP_MS: u32 = 30_000;
+pub const ENDPOINT_PROBE_CAP_MS: u32 = 5_000;
 /// Settle time after a power-resume broadcast before polling.
 pub const RESUME_DELAY_MS: u32 = 3_000;
 
@@ -66,17 +66,20 @@ pub const CONNECT_REFUSED_RETRY_MS: i64 = 1_000;
 /// synchronously with 10050 (no page goes out), so the daemon pages over
 /// RFCOMM instead. Kept so a future stack change shows up as a probe change.
 pub const PAGE_PSM: u32 = 0x0019;
-/// A fresh outage gets this long before the first page: the stack may still
-/// be settling, or the peer blinking.
-pub const PAGE_MIN_DOWN_MS: i64 = 10_000;
-/// Repeat cadence while the link stays down. A page that went out needs no
-/// hurry: either the burst connects, or the ladder repairs the radio.
-pub const PAGE_CADENCE_MS: i64 = 60_000;
+/// Page on the first disconnected poll, before reinstalling any driver.
+pub const PAGE_MIN_DOWN_MS: i64 = 0;
+/// Repeat cadence while down, measured from attempt start. Case-open has no
+/// guaranteed Windows event, so a one-minute cadence delays discovery.
+pub const PAGE_CADENCE_MS: i64 = 10_000;
 /// Hard bound of one page attempt: non-blocking socket + `select`.
 pub const PAGE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 /// After a page went out, the stack gets this long to run the profile burst
 /// (SDP/AVDTP/AVCTP, ~1.4 s in the capture) before the next pass looks.
 pub const PAGE_SETTLE_MS: i64 = 3_000;
+/// Allow the audio endpoint to appear before repairing a transport-only link.
+pub const AUDIO_READY_GRACE_MS: i64 = 20_000;
+/// Audio-driver reconnect clock survives transport-only flaps; independent of paging.
+pub const AUDIO_CONNECT_CADENCE_MS: i64 = 10_000;
 
 /// The reconnect toggle removes and re-installs a profile driver, so it is rate
 /// limited: this is the shortest gap between two toggles.

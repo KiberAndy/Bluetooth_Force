@@ -9,8 +9,8 @@
 //! contract, `BLUETOOTH_SERVICE_ENABLE` on a service that is ALREADY ENABLED
 //! returns `E_INVALIDARG` and does nothing at all. A paired device's audio
 //! services stay enabled across a disconnect, so a plain enable can never pull
-//! the link back up. Removing and re-installing the driver (DISABLE -> quiet ->
-//! ENABLE) is what makes the stack page the earbuds again.
+//! the link back up. DISABLE -> quiet -> ENABLE repairs the local driver;
+//! it does not prove an outgoing page or profile connection. Paging is in page.rs.
 
 use std::fs;
 

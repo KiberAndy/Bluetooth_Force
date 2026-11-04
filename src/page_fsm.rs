@@ -43,6 +43,11 @@ pub fn should_page(now_ms: i64, down_since_ms: i64, page_last_ms: i64) -> bool {
     now_ms - page_last_ms >= PAGE_CADENCE_MS
 }
 
+/// Protect profile bring-up from every fallback rung after a successful page.
+pub fn page_settling(now_ms: i64, settle_until_ms: i64) -> bool {
+    settle_until_ms != 0 && now_ms < settle_until_ms
+}
+
 /// Map a Winsock/`SO_ERROR` code to what the page proved.
 pub fn classify_socket_error(code: i32) -> PageOutcome {
     match code {
@@ -66,6 +71,29 @@ pub fn holds_socket(outcome: PageOutcome, code: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_page_protects_the_entire_settle_window() {
+        let deadline = 100_000 + PAGE_SETTLE_MS;
+        assert!(page_settling(100_000, deadline));
+        assert!(page_settling(deadline - 1, deadline));
+        assert!(!page_settling(deadline, deadline));
+        assert!(!page_settling(100_000, 0));
+    }
+
+    #[test]
+    fn case_open_without_a_device_event_does_not_wait_a_minute() {
+        let down = 100_000;
+        assert!(should_page(down, down, 0), "first poll must page before driver churn");
+        // A peer can return at any phase of the repeat clock. The last-attempt
+        // timestamp may be up to the bounded connect duration before completion.
+        const { assert!(PAGE_CADENCE_MS + POLL_INTERVAL_MS as i64 <= 12_000); }
+        for offset in 1..PAGE_CADENCE_MS {
+            let first_retry = down + PAGE_CADENCE_MS;
+            assert!(should_page(first_retry, down, down));
+            assert!(first_retry - (down + offset) < 10_000);
+        }
+    }
 
     #[test]
     fn no_episode_never_pages() {

@@ -35,7 +35,7 @@ pub fn run(state: &mut SharedState) {
         // link is up, because a link that drops rewrites the device tree and
         // the event delivers that in milliseconds.
         let handles = [state.resume_event, state.device_event];
-        let timeout = poll_wait_ms(state.link_up_since_ms != 0);
+        let timeout = poll_wait_ms(state.link_up_since_ms != 0 && state.keepalive.target_streaming());
         let wait = unsafe {
             kernel32::WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout)
         };
@@ -52,8 +52,11 @@ pub fn run(state: &mut SharedState) {
                 // first post-wake connect wait out the toggle rate limit.
                 state.connect_toggle_last_ms = 0;
                 state.connect_toggle_fails = 0;
+                state.audio_connect_last_ms = 0;
+                state.audio_connect_accepted = false;
                 state.page_last_ms = 0;
                 state.page_fails = 0;
+                state.page_settle_until_ms = 0;
                 // Sockets do not survive sleep: drop the hold so the next
                 // page opens fresh instead of guarding a dead handle.
                 if let Some(s) = take_held_page(state) {
@@ -367,21 +370,38 @@ fn handle_found(state: &mut SharedState, radio_handle: HANDLE, device_info: &BLU
 
     match action {
         PollAction::None => {}
-        PollAction::StartKeepalive => on_connected(state, &name),
+        PollAction::StartKeepalive => {
+            on_connected(state, &name);
+            if !state.watchdog_tripped && !state.keepalive.target_streaming() {
+                // Native audio requests must not wait for a 20 s transport
+                // grace: observed control-only links last just six seconds.
+                recover_link(state, radio_handle, device_info);
+            }
+        },
         PollAction::StopAndConnect => on_disconnected(state, radio_handle, device_info, &name),
     }
 }
 
 fn on_connected(state: &mut SharedState, name: &str) {
-    state.connect_fails = 0;
-    state.next_connect_ms = 0;
-    // A live link is the only proof the reconnect path worked.
-    state.connect_toggle_fails = 0;
-
     if state.link_up_since_ms == 0 {
         state.link_up_since_ms = now_ms();
-        btlog!("link UP");
+        btlog!("link UP (transport only; waiting for target audio)");
     }
+    if !state.watchdog_tripped {
+        state.keepalive.start(name);
+    }
+    // An RFCOMM link is not A2DP readiness. Do not cancel recovery, slow the
+    // poll timer, or release the page hold for a default-device fallback.
+    if !state.keepalive.target_streaming() {
+        state.link_stable_polls = 0;
+        return;
+    }
+    if state.link_stable_polls == 0 {
+        btlog!("audio READY: keepalive buffer queued to the target endpoint");
+    }
+    state.connect_fails = 0;
+    state.next_connect_ms = 0;
+    state.connect_toggle_fails = 0;
 
     // Flap hysteresis: a lone connected poll is a blip, not a cure.
     state.link_stable_polls = state.link_stable_polls.saturating_add(1);
@@ -396,6 +416,8 @@ fn on_connected(state: &mut SharedState, name: &str) {
         state.flaps_in_episode = 0;
         state.down_since_ms = 0;
         state.stall_report_ms = 0;
+        state.audio_connect_last_ms = 0;
+        state.audio_connect_accepted = false;
         state.page_last_ms = 0;
         state.page_fails = 0;
         // The link is stable and Windows holds it: our DLC is redundant,
@@ -416,9 +438,6 @@ fn on_connected(state: &mut SharedState, name: &str) {
         );
     }
 
-    if !state.watchdog_tripped {
-        state.keepalive.start(name);
-    }
 }
 
 /// Take the held page socket out of the state (`None` = no hold).
@@ -454,6 +473,12 @@ fn on_disconnected(
         return;
     }
 
+    recover_link(state, radio_handle, device_info);
+}
+
+/// Also reachable with a live transport and missing audio; keep the endpoint
+/// probe thread running in that case so readiness can end recovery promptly.
+fn recover_link(state: &mut SharedState, radio_handle: HANDLE, device_info: &BLUETOOTH_DEVICE_INFO) {
     let now = now_ms();
     if state.down_since_ms == 0 {
         state.down_since_ms = now;
@@ -549,14 +574,44 @@ fn on_disconnected(
         return;
     }
 
-    // PAGE-FIRST: an outgoing page is the only action ever observed to put
+    // Endpoint probing runs concurrently with mandatory repair. Never churn
+    // a transport whose target audio became ready while we were repairing.
+    if device_info.fConnected != 0 && state.keepalive.target_streaming() {
+        return;
+    }
+
+    // Ask the audio driver to establish A2DP, including while fConnected is
+    // nonzero. An idle raw HFP DLC does not perform a profile handshake.
+    // This clock survives link blips; S_OK is a request receipt, never READY.
+    if crate::audio_connect::due(now, state.audio_connect_last_ms) {
+        state.audio_connect_last_ms = now_ms();
+        state.audio_connect_accepted = crate::audio_connect::request(state.target_mac)
+            .is_some_and(|hr| hr >= 0);
+    }
+    if state.audio_connect_accepted {
+        // The audio driver owns reconnect retries now. Do not compete with it
+        // by opening HFP or removing/reinstalling the same A2DP driver.
+        return;
+    }
+    // Unsupported/failed native path: preserve the bounded legacy fallback,
+    // but let a newly connected transport settle before destructive repair.
+    if device_info.fConnected != 0 && now - state.link_up_since_ms < AUDIO_READY_GRACE_MS {
+        return;
+    }
+
+    // PAGE-FIRST fallback: an outgoing page is the only action ever observed to put
     // bytes on the air toward the peer (docs/manual_connect_path.md). It is an
     // RFCOMM connect (the field probe proved L2CAP is refused pre-page). It
     // runs on its own clock -- independent of the toggle rate limit -- after
     // rung 0 (the radio must be healthy) and before R1 (no reason to reset a
     // radio that has not paged yet). A page emits no device-tree churn, so the
     // self-echo guard is deliberately NOT stamped here.
-    if should_page(now, state.down_since_ms, state.page_last_ms) {
+    // A successful page's settle deadline protects ALL fallback rungs, not
+    // just the final service toggle. Safety repair above remains reachable.
+    if crate::page_fsm::page_settling(now, state.page_settle_until_ms) {
+        return;
+    }
+    if device_info.fConnected == 0 && should_page(now, state.down_since_ms, state.page_last_ms) {
         state.page_last_ms = now_ms();
         match page::page_hold(state.target_mac) {
             (PageResult::Attempted, held) => {
@@ -574,7 +629,8 @@ fn on_disconnected(
                     state.held_page_socket = new as u64;
                 }
                 state.page_fails = 0;
-                state.next_connect_ms = now_ms() + PAGE_SETTLE_MS;
+                state.page_settle_until_ms = now_ms() + PAGE_SETTLE_MS;
+                state.next_connect_ms = state.page_settle_until_ms;
                 return;
             }
             (PageResult::Unreachable, _) | (PageResult::Failed, _) => {
@@ -587,6 +643,10 @@ fn on_disconnected(
         }
     }
 
+    // Do not reset the radio for an unidentifiable audio endpoint on an
+    // otherwise connected transport. Only bounded profile repair below is
+    // allowed there; hardware escalation requires an actually down link.
+    if device_info.fConnected == 0 {
     // R1 — page-scan toggle.
     if state.r1_armed_ms == 0 {
         state.r1_armed_ms = now;
@@ -727,6 +787,10 @@ fn on_disconnected(
         state.r4_fails = state.r4_fails.saturating_add(1);
     }
 
+    }
+    if device_info.fConnected != 0 && state.keepalive.target_streaming() {
+        return;
+    }
     if now < state.next_connect_ms {
         return; // L3 backoff window
     }
@@ -928,4 +992,32 @@ fn radio_reset(api: &BthApi, hradio: HANDLE) -> bool {
     }
     btlog!("R1: radio reset complete");
     true
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use crate::audio::SilentKeepalive;
+
+    #[test]
+    fn transport_without_target_audio_never_closes_the_episode() {
+        let mut state = SharedState::new(
+            0, ptr::null_mut(), ptr::null_mut(),
+            BthApi::load().expect("Windows Bluetooth API"), SilentKeepalive::new(None),
+        );
+        // Prevent real audio work in this state-machine regression.
+        state.watchdog_tripped = true;
+        state.down_since_ms = 123;
+        state.next_connect_ms = 456;
+        state.connect_toggle_fails = 4;
+        state.r1_armed_ms = 123;
+        for _ in 0..LINK_STABLE_POLLS_TO_CLOSE + 1 {
+            on_connected(&mut state, "earbuds");
+        }
+        assert_eq!(state.link_stable_polls, 0);
+        assert_eq!(state.down_since_ms, 123);
+        assert_eq!(state.next_connect_ms, 456);
+        assert_eq!(state.connect_toggle_fails, 4);
+        assert_eq!(state.r1_armed_ms, 123);
+    }
 }
